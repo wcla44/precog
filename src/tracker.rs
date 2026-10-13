@@ -4,7 +4,7 @@
 use crate::gaze::NF;
 use crate::gestures::{classify, Pose, Swipe, SwipeDetector};
 use crate::now;
-use crate::vision::{FaceMesh, GazeNet, HandTracker, IrisModel, Rgb};
+use crate::vision::{FaceMesh, HandTracker, IrisModel, Rgb};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -68,9 +68,8 @@ fn head_angles_3d(p: &[[f32; 3]]) -> (f32, f32) {
     (y[2].clamp(-1.0, 1.0).asin(), x[2].clamp(-1.0, 1.0).asin()) // (pitch, yaw)
 }
 
-/// 16 features: iris offsets + eyelid openness for both eyes, head pose (3D axes + 2D geometry), face position/scale,
-/// and the gaze network's (yaw, pitch), which already combine eye and head rotation.
-pub fn features(p: &[[f32; 3]], w: usize, h: usize, net: (f32, f32)) -> [f64; NF] {
+/// 14 features: iris offsets + eyelid openness for both eyes, head pose (3D axes + 2D geometry), face position/scale.
+pub fn features(p: &[[f32; 3]], w: usize, h: usize) -> [f64; NF] {
     let [rx, ry, ro] = eye_features(p, EYES[0]);
     let [lx, ly, lo] = eye_features(p, EYES[1]);
     let (e1, e2) = (p[33], p[263]);
@@ -90,7 +89,6 @@ pub fn features(p: &[[f32; 3]], w: usize, h: usize, net: (f32, f32)) -> [f64; NF
         pitch3 as f64, yaw3 as f64, roll as f64,
         cx as f64, cy as f64, (face_w / w as f32) as f64,
         yaw as f64, pitch as f64,
-        (net.0 / 30.0) as f64, (net.1 / 30.0) as f64,
     ]
 }
 
@@ -151,8 +149,6 @@ fn run(
     record: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let mut face = FaceMesh::new(models)?;
-    let mut gaze_net = GazeNet::new(models).map_err(|e| eprintln!("gaze network unavailable ({e:#})")).ok();
-    let mut net = (0.0f32, 0.0f32);
     let mut iris = IrisModel::new(models).map_err(|e| eprintln!("iris model unavailable ({e:#}): using face-mesh iris")).ok();
     let mut hands: Option<HandTracker> = None;
     let cam = Cam::open(camera).map_err(|e| {
@@ -172,12 +168,7 @@ fn run(
             p[468][..2].copy_from_slice(&r);
             p[473][..2].copy_from_slice(&l);
         }
-        // the gaze network and the hand model take turns, one per frame, to hold ~30 fps
-        let hands_turn = use_hands.load(Ordering::Relaxed) && n % 2 == 1;
-        if let (Some(p), Some(g), false) = (mesh.as_ref(), gaze_net.as_mut(), hands_turn) {
-            net = g.process(&rgb, p)?;
-        }
-        let feats = mesh.as_ref().map(|p| features(p, w, h, net));
+        let feats = mesh.as_ref().map(|p| features(p, w, h));
         let crop = match (&mesh, record.load(Ordering::Relaxed)) {
             (Some(p), true) => face_jpeg(&img.data, w, h, p).map(Arc::new),
             _ => None,
@@ -192,7 +183,8 @@ fn run(
             if hands.is_none() {
                 hands = Some(HandTracker::new(models)?);
             }
-            if n % 2 == 1 {
+            if n % 2 == 0 {
+                // hands every other frame: saves CPU
                 let lm = hands.as_mut().unwrap().process(&rgb)?;
                 let pts: Option<Vec<[f32; 2]>> = lm.map(|p| p.iter().map(|q| [q[0] / h as f32, q[1] / h as f32]).collect());
                 pose = pts.as_ref().map(|p| classify(p));

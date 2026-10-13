@@ -394,18 +394,6 @@ impl IrisModel {
     }
 }
 
-/// Appearance-based gaze network (MobileGaze / L2CS-Net family, MobileOne-S0 trained on Gaze360):
-/// face crop -> gaze yaw / pitch in degrees, *including* head pose. That makes it far more robust to head
-/// movement than iris-in-eye geometry; the per-user calibration then maps these angles to the screen.
-pub struct GazeNet {
-    session: Session,
-    input: String,
-}
-
-const GAZE_IN: usize = 448;
-const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
-const STD: [f32; 3] = [0.229, 0.224, 0.225];
-
 /// Tight face box from the mesh: (x0, y0, w, h).
 pub fn face_box(mesh: &[[f32; 3]]) -> (f32, f32, f32, f32) {
     let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
@@ -416,44 +404,4 @@ pub fn face_box(mesh: &[[f32; 3]]) -> (f32, f32, f32, f32) {
         y1 = y1.max(p[1]);
     }
     (x0, y0, x1 - x0, y1 - y0)
-}
-
-impl GazeNet {
-    pub fn new(dir: &Path) -> Result<Self> {
-        let s = session(dir, "mobileone_s0_gaze.onnx")?;
-        Ok(Self { input: input_name(&s), session: s })
-    }
-
-    /// (yaw, pitch) in degrees.
-    pub fn process(&mut self, img: &Rgb, mesh: &[[f32; 3]]) -> Result<(f32, f32)> {
-        let (x0, y0, w, h) = face_box(mesh);
-        // stretch the box to 448x448 like cv2.resize (half-pixel centres)
-        let (kx, ky) = (w / GAZE_IN as f32, h / GAZE_IN as f32);
-        let m = Affine([kx, 0.0, x0 + 0.5 * kx - 0.5, 0.0, ky, y0 + 0.5 * ky - 0.5]);
-        let hwc = warp_rect(img, m, GAZE_IN);
-        let n = GAZE_IN * GAZE_IN;
-        let mut chw = vec![0f32; 3 * n];
-        for (i, px) in hwc.chunks_exact(3).enumerate() {
-            for c in 0..3 {
-                chw[c * n + i] = (px[c] / 255.0 - MEAN[c]) / STD[c];
-            }
-        }
-        let tensor = Tensor::from_array(([1usize, 3, GAZE_IN, GAZE_IN], chw))?;
-        let outputs = self.session.run(ort::inputs![self.input.as_str() => tensor])?;
-        let decode = |logits: &[f32]| {
-            // 90 bins of 4 degrees from -180: expectation over the softmax
-            let mx = logits.iter().copied().fold(f32::MIN, f32::max);
-            let e: Vec<f32> = logits.iter().map(|l| (l - mx).exp()).collect();
-            let sum: f32 = e.iter().sum();
-            e.iter().enumerate().map(|(i, p)| i as f32 * p).sum::<f32>() / sum * 4.0 - 180.0
-        };
-        let (_, yaw) = outputs[0].try_extract_tensor::<f32>()?;
-        let (_, pitch) = outputs[1].try_extract_tensor::<f32>()?;
-        Ok((decode(yaw), decode(pitch)))
-    }
-}
-
-/// Same as `warp` but returns raw 0..255 HWC values (caller normalises).
-fn warp_rect(img: &Rgb, m: Affine, out: usize) -> Vec<f32> {
-    warp(img, m, out, |p| p)
 }

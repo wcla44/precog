@@ -5,7 +5,7 @@ use crate::actions::{self, Action};
 use crate::agent::Agent;
 use crate::cloud::{self, Smudge};
 use crate::dictation::{self, Dictation};
-use crate::gaze::{FixationFilter, GazeModel, CLICK_GROUP, FEATURE_VERSION, NF};
+use crate::gaze::{ClickCorrector, FixationFilter, GazeModel, CLICK_GROUP, FEATURE_VERSION, NF};
 use crate::gestures::{Debounce, Pose, Swipe};
 use crate::monitors::{self, Monitor};
 use crate::settings::Settings;
@@ -14,7 +14,6 @@ use crate::tray::{self, Tray};
 use crate::{llm, now, paths};
 use egui::{Align2, Color32, CornerRadius, FontId, Frame, Margin, Pos2, ViewportBuilder, ViewportCommand, ViewportId};
 use parking_lot::Mutex;
-use rand::seq::SliceRandom;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,23 +37,20 @@ struct Calibration {
 }
 
 impl Calibration {
-    const SETTLE: f64 = 0.7;
-    const SWITCH_SETTLE: f64 = 1.4;
-    const COLLECT: f64 = 1.0;
+    // short on purpose: clicks keep refining the model afterwards
+    const SETTLE: f64 = 0.45;
+    const SWITCH_SETTLE: f64 = 1.0;
+    const COLLECT: f64 = 0.65;
 
     fn new(mons: &[Monitor]) -> Self {
-        let mut rng = rand::rng();
         let mut points = Vec::new();
         for (mi, m) in mons.iter().enumerate() {
-            let (cols, rows) = if m.width >= 1800 { (5, 4) } else { (4, 4) }; // wide screens get an extra column
-            let mut pts: Vec<(usize, f64, f64)> = (0..cols * rows)
-                .map(|k| {
-                    let fx = 0.05 + 0.9 * (k % cols) as f64 / (cols - 1) as f64;
-                    let fy = 0.05 + 0.9 * (k / cols) as f64 / (rows - 1) as f64;
-                    (mi, m.left as f64 + fx * m.width as f64, m.top as f64 + fy * m.height as f64)
-                })
-                .collect();
-            pts.shuffle(&mut rng);
+            // 3x3 per screen in a snake path: predictable, so the eyes get there fast
+            let pts = (0..9).map(|k| {
+                let (row, col) = (k / 3, if (k / 3) % 2 == 0 { k % 3 } else { 2 - k % 3 });
+                let (fx, fy) = (0.06 + 0.44 * col as f64, 0.08 + 0.42 * row as f64);
+                (mi, m.left as f64 + fx * m.width as f64, m.top as f64 + fy * m.height as f64)
+            });
             points.extend(pts);
         }
         let mut model = GazeModel::default();
@@ -249,6 +245,9 @@ pub struct PrecogApp {
     tray_status: String,
     show_settings: bool,
     smudge: Smudge,
+    corrector: ClickCorrector,
+    /// Gaze error measured at each click, before learning from it: the real-world accuracy.
+    click_errs: std::collections::VecDeque<f64>,
     last: f64,
     custom_model: String,
 }
@@ -311,6 +310,8 @@ impl PrecogApp {
             tray_status: String::new(),
             show_settings: false,
             smudge: Smudge::new(),
+            corrector: ClickCorrector::new(),
+            click_errs: Default::default(),
             last: now(),
         };
         app.apply();
@@ -370,7 +371,8 @@ impl PrecogApp {
         match (&f, &self.model) {
             (Some(fr), Some(m)) if self.face && self.calib.is_none() => {
                 if let Some((x, y)) = m.predict(fr.features.as_ref().unwrap()) {
-                    let (x, y) = monitors::clamp(&self.monitors, x, y);
+                    let c = self.corrector.correction([x, y], t);
+                    let (x, y) = monitors::clamp(&self.monitors, x + c[0], y + c[1]);
                     let p = self.filter.update([x, y], t);
                     self.gaze = Some((p[0], p[1]));
                 }
@@ -492,14 +494,18 @@ impl PrecogApp {
                 );
                 self.model = Some(c.model);
                 self.n_clicks = 0;
+                self.corrector = ClickCorrector::new();
+                self.click_errs.clear();
             }
             Err(e) => println!("calibration failed: {e:#}"),
         }
     }
 
-    /// Implicit calibration: people look at what they click ~100-300 ms before the click.
+    /// Continuous recalibration: people look at what they click ~100-300 ms before the click. Each click is
+    /// scored first (real-world accuracy), skipped if the user clearly wasn't looking, then learned: refit + local
+    /// correction. Silent, no UI.
     fn learn_from_clicks(&mut self) {
-        let mut refit = false;
+        let mut learned = false;
         while let Ok((t, x, y)) = self.tracker.clicks.try_recv() {
             if !self.cfg.learn || self.calib.is_some() || self.popup.is_some() {
                 continue;
@@ -509,14 +515,36 @@ impl PrecogApp {
             if feats.len() < 3 {
                 continue;
             }
-            m.add(&feats, [x, y], CLICK_GROUP + self.n_clicks as i64, 0.5);
+            let mut mean = [0.0; NF];
+            for f in &feats {
+                for i in 0..NF {
+                    mean[i] += f[i] / feats.len() as f64;
+                }
+            }
+            if let Some((px, py)) = m.predict(&mean) {
+                let c = self.corrector.correction([px, py], t);
+                let err = ((px + c[0] - x).powi(2) + (py + c[1] - y).powi(2)).sqrt();
+                let med = median(&self.click_errs);
+                if self.click_errs.len() >= 5 && err > (3.0 * med).max(700.0) {
+                    continue; // looking elsewhere while clicking: not a valid label
+                }
+                self.click_errs.push_back(err);
+                while self.click_errs.len() > 30 {
+                    self.click_errs.pop_front();
+                }
+            }
+            m.add(&feats, [x, y], CLICK_GROUP + self.n_clicks as i64, 1.0);
+            self.corrector.add(t, [x, y], mean);
             self.n_clicks += 1;
-            refit |= self.n_clicks % 5 == 0;
+            learned = true;
         }
-        if refit {
+        if learned {
             if let Some(m) = &mut self.model {
-                if m.fit().is_ok() {
-                    let _ = m.save(&paths::gaze_model());
+                if m.refit().is_ok() {
+                    self.corrector.update_residuals(m);
+                    if self.n_clicks % 10 == 0 {
+                        let _ = m.save(&paths::gaze_model());
+                    }
                 }
             }
         }
@@ -588,8 +616,10 @@ impl PrecogApp {
         if self.cfg.gesture {
             parts.push(Pose::icon(self.pose).into());
         }
-        if let Some(m) = &self.model {
-            parts.push(format!("err~{:.0}px clicks:{}", m.cv_error(), self.n_clicks));
+        if !self.click_errs.is_empty() {
+            parts.push(format!("click err~{:.0}px ({} clicks)", median(&self.click_errs), self.n_clicks));
+        } else if let Some(m) = &self.model {
+            parts.push(format!("calib err~{:.0}px", m.cv_error()));
         }
         if self.dictation.state() != dictation::State::Idle {
             parts.push(format!("🎙 {:?}", self.dictation.state()).to_lowercase());
@@ -779,6 +809,15 @@ impl PrecogApp {
         }
         self.commit(c);
     }
+}
+
+fn median(v: &std::collections::VecDeque<f64>) -> f64 {
+    if v.is_empty() {
+        return f64::NAN;
+    }
+    let mut s: Vec<f64> = v.iter().copied().collect();
+    s.sort_by(f64::total_cmp);
+    s[s.len() / 2]
 }
 
 fn overlay(title: &str, size: [f32; 2], pos: [f32; 2]) -> ViewportBuilder {

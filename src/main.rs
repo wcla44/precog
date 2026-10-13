@@ -86,11 +86,6 @@ fn main() -> anyhow::Result<()> {
         time("iris (2 eyes)", &mut || {
             iris.process(&rgb, &p).unwrap();
         });
-        let mut gnet = vision::GazeNet::new(&dir)?;
-        println!("gaze net on this face: {:?} (yaw, pitch) deg", gnet.process(&rgb, &p)?);
-        time("gaze net", &mut || {
-            gnet.process(&rgb, &p).unwrap();
-        });
         time("hand", &mut || {
             hand.process(&rgb).unwrap();
         });
@@ -111,11 +106,7 @@ fn main() -> anyhow::Result<()> {
             Some(p) => Some(vision::IrisModel::new(&dir)?.process(&rgb, p)?),
             None => None,
         };
-        let net = match &face {
-            Some(p) => vision::GazeNet::new(&dir)?.process(&rgb, p)?,
-            None => (0.0, 0.0),
-        };
-        let feats = face.as_ref().map(|p| tracker::features(p, w, h, net).to_vec());
+        let feats = face.as_ref().map(|p| tracker::features(p, w, h).to_vec());
         let pose = hand.as_ref().map(|p| format!("{:?}", gestures::classify(&p.iter().map(|q| [q[0], q[1]]).collect::<Vec<_>>())));
         println!("{}", serde_json::json!({"face": face, "hand": hand, "iris": iris, "features": feats, "pose": pose}));
         return Ok(());
