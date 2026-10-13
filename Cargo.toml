@@ -1,0 +1,54 @@
+[package]
+name = "precog"
+version = "0.2.0"
+edition = "2021"
+description = "Gaze-aware proactive desktop assistant: webcam eye tracking, hand gestures, voice typing, LLM suggestions"
+license = "GPL-3.0-only"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+crossbeam-channel = "0.5"
+device_query = "4"
+dirs = "6"
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.36"
+enigo = "0.6"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+nalgebra = "0.35"
+
+ort = "=2.0.0-rc.14"
+parking_lot = "0.12"
+rand = "0.9"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+cpal = "0.18"
+tray-icon = "0.26"
+xcap = "0.9"
+clap = { version = "4", features = ["derive"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nokhwa = { version = "0.10", features = ["input-native"] } # only for the camera permission prompt
+dispatch2 = "0.3"
+objc2 = "0.6"
+objc2-av-foundation = { version = "0.3", features = ["AVCaptureSession", "AVCaptureInput", "AVCaptureOutputBase", "AVCaptureVideoDataOutput", "AVCaptureDevice", "AVMediaFormat", "AVCaptureSessionPreset", "objc2-core-media", "dispatch2"] }
+objc2-core-media = { version = "0.3", features = ["CMSampleBuffer", "objc2-core-video"] }
+objc2-core-video = { version = "0.3", features = ["CVPixelBuffer", "CVImageBuffer", "CVBuffer", "CVBase", "CVReturn"] }
+objc2-foundation = { version = "0.3", features = ["NSDictionary", "NSString", "NSValue", "NSError", "NSArray"] }
+core-foundation = "0.10"
+core-graphics = "0.25"
+whisper-rs = { version = "0.16", features = ["metal"] }
+winit = "0.30"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+nokhwa = { version = "0.10", features = ["input-native"] }
+whisper-rs = "0.16"
+winit = "0.30"
+
+[profile.release]
+opt-level = 3
+
+[profile.dev]
+opt-level = 2

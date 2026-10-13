@@ -1,0 +1,18 @@
+[project]
+name = "precog"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=1.13.0",
+    "faster-whisper>=1.2.1",
+    "httpx>=0.28.1",
+    "mediapipe>=1.1.0",
+    "mss>=10.2.0",
+    "numpy>=2.5.4",
+    "opencv-python>=5.0.0.93",
+    "pillow>=12.3.0",
+    "pynput>=1.8.2",
+    "pystray>=0.19.5",
+]
