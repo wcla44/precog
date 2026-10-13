@@ -3,9 +3,9 @@
 
 use crate::actions::{self, Action};
 use crate::agent::Agent;
-use crate::cloud::{self, GazeCloud};
+use crate::cloud::{self, Smudge};
 use crate::dictation::{self, Dictation};
-use crate::gaze::{GazeModel, OneEuro, CLICK_GROUP, NF};
+use crate::gaze::{FixationFilter, GazeModel, CLICK_GROUP, FEATURE_VERSION, NF};
 use crate::gestures::{Debounce, Pose, Swipe};
 use crate::monitors::{self, Monitor};
 use crate::settings::Settings;
@@ -31,6 +31,8 @@ struct Calibration {
     t0: f64,
     settle: f64,
     model: GazeModel,
+    /// Raw landmarks per dot, saved for offline tuning of features / models.
+    raw: Vec<serde_json::Value>,
 }
 
 impl Calibration {
@@ -55,7 +57,8 @@ impl Calibration {
         }
         let mut model = GazeModel::default();
         model.layout = mons.iter().map(|m| m.layout()).collect();
-        Self { points, i: None, t0: 0.0, settle: Self::SWITCH_SETTLE, model }
+        model.version = FEATURE_VERSION;
+        Self { points, i: None, t0: 0.0, settle: Self::SWITCH_SETTLE, model, raw: Vec::new() }
     }
 
     fn start_point(&mut self, i: usize, t: f64) {
@@ -71,11 +74,16 @@ impl Calibration {
         if t - self.t0 < self.settle + Self::COLLECT {
             return false;
         }
-        let feats = tracker.features_between(self.t0 + self.settle, self.t0 + self.settle + Self::COLLECT);
+        let (t0, t1) = (self.t0 + self.settle, self.t0 + self.settle + Self::COLLECT);
+        let feats = tracker.features_between(t0, t1);
+        let (mi, x, y) = self.points[i];
         if feats.len() >= 5 {
-            let (_, x, y) = self.points[i];
             self.model.add(&feats, [x, y], i as i64, 1.0);
         }
+        self.raw.push(serde_json::json!({
+            "monitor": mi, "target": [x, y],
+            "frames": tracker.raw_between(t0, t1).iter().map(|r| r.as_slice().to_vec()).collect::<Vec<_>>(),
+        }));
         if i + 1 >= self.points.len() {
             return true;
         }
@@ -215,7 +223,7 @@ pub struct PrecogApp {
     monitors: Vec<Monitor>,
     tracker: Tracker,
     model: Option<GazeModel>,
-    filter: OneEuro,
+    filter: FixationFilter,
     gaze: Option<(f64, f64)>,
     face: bool,
     agent: Agent,
@@ -233,8 +241,7 @@ pub struct PrecogApp {
     tray: Option<Tray>,
     tray_status: String,
     show_settings: bool,
-    cloud: GazeCloud,
-    cloud_pos: Option<[f64; 2]>,
+    smudge: Smudge,
     last: f64,
     custom_model: String,
 }
@@ -259,6 +266,7 @@ impl PrecogApp {
         let path = paths::gaze_model();
         if path.exists() && !opts.calibrate {
             match GazeModel::load(&path) {
+                Ok(m) if m.version != FEATURE_VERSION => println!("gaze features changed since last calibration: recalibrating"),
                 Ok(m) if m.layout == monitors.iter().map(|m| m.layout()).collect::<Vec<_>>() => model = Some(m),
                 Ok(_) => println!("screen layout changed since last calibration: recalibrating"),
                 Err(e) => println!("could not load gaze model ({e:#}): recalibrating"),
@@ -278,7 +286,7 @@ impl PrecogApp {
             monitors,
             tracker,
             model,
-            filter: OneEuro::new(),
+            filter: FixationFilter::new(100.0),
             gaze: None,
             face: false,
             popup: None,
@@ -295,11 +303,13 @@ impl PrecogApp {
             tray,
             tray_status: String::new(),
             show_settings: false,
-            cloud: GazeCloud::new(),
-            cloud_pos: None,
+            smudge: Smudge::new(),
             last: now(),
         };
         app.apply();
+        if let Some(m) = &app.model {
+            app.filter = FixationFilter::new(m.cv_error() * 0.5);
+        }
         if app.cfg.gesture && app.cfg.voice {
             app.dictation.preload();
         }
@@ -354,15 +364,17 @@ impl PrecogApp {
             (Some(fr), Some(m)) if self.face && self.calib.is_none() => {
                 if let Some((x, y)) = m.predict(fr.features.as_ref().unwrap()) {
                     let (x, y) = monitors::clamp(&self.monitors, x, y);
-                    let p = self.filter.filter([x, y], t);
+                    let p = self.filter.update([x, y], t);
                     self.gaze = Some((p[0], p[1]));
                 }
             }
-            _ if !self.face => self.gaze = None,
+            _ if !self.face => {
+                self.gaze = None;
+                self.filter.reset();
+            }
             _ => {}
         }
-
-        self.cloud_pos = self.cloud.update(t, dt, if self.calib.is_none() { self.gaze } else { None });
+        self.smudge.set_noise(self.filter.jitter(), dt);
         self.learn_from_clicks();
         self.handle_tray(ctx);
 
@@ -455,9 +467,16 @@ impl PrecogApp {
             println!("calibration cancelled/failed (is your face visible?)");
             return;
         }
+        let raw_path = paths::data_dir().join("calibrations").join(format!(
+            "{}.json",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+        ));
+        let _ = std::fs::create_dir_all(raw_path.parent().unwrap());
+        let _ = std::fs::write(&raw_path, serde_json::to_vec(&serde_json::json!({ "layout": c.model.layout, "points": c.raw })).unwrap_or_default());
         match c.model.fit() {
             Ok(err) => {
                 let _ = c.model.save(&paths::gaze_model());
+                self.filter = FixationFilter::new(err * 0.5);
                 println!(
                     "calibrated on {} screen(s): {} samples, cross-validated median error {err:.0}px",
                     self.monitors.len(),
@@ -588,18 +607,19 @@ impl PrecogApp {
     }
 
     fn gaze_cloud(&mut self, ctx: &egui::Context) {
-        let Some([x, y]) = self.cloud_pos else { return };
+        let Some((x, y)) = self.gaze else { return };
         if !self.cfg.dot || self.calib.is_some() {
             return;
         }
         let s = cloud::SIZE;
-        let cloud = &self.cloud;
+        let smudge = &mut self.smudge;
         // click-through, so it never needs to dodge the cursor
         ctx.show_viewport_immediate(
             ViewportId::from_hash_of("gaze"),
             overlay("precog gaze", [s, s], [x as f32 - s / 2.0, y as f32 - s / 2.0]).with_mouse_passthrough(true),
             |ui, _| {
-                egui::CentralPanel::no_frame().show(ui, |ui| cloud.paint(ui.painter(), Pos2::new(s / 2.0, s / 2.0), now()));
+                let ctx = ui.ctx().clone();
+                egui::CentralPanel::no_frame().show(ui, |ui| smudge.paint(&ctx, ui.painter(), Pos2::new(s / 2.0, s / 2.0), now()));
             },
         );
     }

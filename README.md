@@ -60,13 +60,16 @@ Command-line flags (they apply to this run only): `--calibrate`, `--no-agent`, `
 - `~/.config/precog/config.json`: settings. Written with mode 600 because it may contain an API key. It is shared with the Python version.
 - `~/.local/share/precog/gaze_model.json`: calibration and click samples, plus the screen layout they were recorded on. If the layout changes, precog recalibrates.
 - `~/.local/share/precog/whisper/`: speech models.
+- `~/.local/share/precog/calibrations/*.json`: raw face landmarks recorded during each calibration, for offline tuning of the gaze features and model.
 - `~/.cache/precog/last_screen.jpg`: the last screenshot sent to the LLM. Only written when `PRECOG_DEBUG=1`.
+
+**Gaze smudge**: where you look is shown as a soft, animated haze. The centre is see-through, so you can still read what you're looking at. Its size reflects how noisy the gaze currently is.
 
 ## How it works
 
 - **Vision** (`src/vision.rs`): MediaPipe's face detector, 478-point face mesh (iris included), palm detector and hand landmark model, converted to ONNX and run with ONNX Runtime. Anchor decoding, rotated region-of-interest crops and frame-to-frame tracking follow MediaPipe. On test images, face landmarks are within about 1px of MediaPipe's.
-- **Gaze features** (`src/tracker.rs`): for each eye, the iris position measured along the eye-corner axis and eyelid openness; head roll, yaw and pitch, computed both from 2D geometry and from landmark depth; face position and scale. That's 14 values.
-- **Gaze model** (`src/gaze.rs`): standardised features plus quadratic iris and head terms, fitted with ridge regression. The regularisation strength is picked by holding out whole calibration dots, so the error the HUD shows is honest. Output is smoothed with a One-Euro filter. Every 5 clicks, precog refits using the eye data from 50–350ms before each click.
+- **Gaze features** (`src/tracker.rs`): for each eye, the iris centre is refined by MediaPipe's dedicated iris model (a 64×64 eye crop) and measured along the eye-corner axis, plus eyelid openness. Head yaw and pitch come from the face's 3D axes and from 2D geometry, plus roll and face position and scale. That's 14 values.
+- **Gaze model** (`src/gaze.rs`): standardised features plus quadratic iris and head terms, fitted with ridge regression. The regularisation strength is picked by holding out whole calibration dots, so the error the HUD shows is honest. The output goes through a fixation-aware filter: samples are averaged while you're fixating, and the filter jumps as soon as 2–3 frames agree on a new spot (a saccade), so it doesn't lag. Every 5 clicks, precog refits using the eye data from 50–350ms before each click.
 - **Gestures** (`src/gestures.rs`): open, fist and pinch are told apart from finger geometry. Swipes are detected from how fast and far the wrist moves.
 - **Voice typing** (`src/dictation.rs`): microphone audio goes through a simple voice-activity check that splits it into phrases at pauses; each phrase is transcribed by Whisper (Metal GPU on macOS) and typed.
 - **Agent** (`src/agent.rs`): when your gaze stays within 160px for the fixation time, precog takes a screenshot of that monitor, draws your gaze trail on it, and sends it to the LLM. The LLM returns one JSON action or "none". Destructive commands are filtered out.

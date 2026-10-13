@@ -318,3 +318,51 @@ impl HandTracker {
         Ok(Some(pts))
     }
 }
+
+/// MediaPipe iris model: 64x64 crop per eye -> refined iris centre (5 iris points + 71 eye-contour points).
+/// More precise than the face mesh's own iris points, which come from a 256x256 crop of the whole face.
+/// Pre-processing found empirically against the face mesh: input [0, 1], the subject's right eye is mirrored.
+pub struct IrisModel {
+    session: Session,
+    input: String,
+}
+
+/// (corner 1, corner 2, mirror?) for the subject's right eye, then left eye.
+const IRIS_EYES: [(usize, usize, bool); 2] = [(33, 133, true), (362, 263, false)];
+
+impl IrisModel {
+    pub fn new(dir: &Path) -> Result<Self> {
+        let s = session(dir, "iris_landmark.onnx")?;
+        Ok(Self { input: input_name(&s), session: s })
+    }
+
+    /// Refined iris centres (right eye, left eye) in image pixels, from face-mesh eye corners.
+    pub fn process(&mut self, img: &Rgb, mesh: &[[f32; 3]]) -> Result<[[f32; 2]; 2]> {
+        let mut out = [[0.0; 2]; 2];
+        for (k, &(c1, c2, mirror)) in IRIS_EYES.iter().enumerate() {
+            let (a, b) = (mesh[c1], mesh[c2]);
+            let angle = norm_angle(-(-(b[1] - a[1])).atan2(b[0] - a[0]));
+            let side = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt() * 2.3;
+            let roi = Roi { cx: (a[0] + b[0]) / 2.0, cy: (a[1] + b[1]) / 2.0, side, angle };
+            let m = roi.affine(64);
+            // mirrored crop: pixel u of the input is pixel 63-u of the crop
+            let mf = if mirror {
+                let p = m.0;
+                Affine([-p[0], p[1], p[0] * 63.0 + p[2], -p[3], p[4], p[3] * 63.0 + p[5]])
+            } else {
+                m
+            };
+            let data = warp(img, mf, 64, |p| p / 255.0);
+            let tensor = Tensor::from_array(([1usize, 64, 64, 3], data))?;
+            let outputs = self.session.run(ort::inputs![self.input.as_str() => tensor])?;
+            let (_, iris) = outputs[1].try_extract_tensor::<f32>()?;
+            let (mut x, y) = (iris[0], iris[1]); // centre of the iris
+            if mirror {
+                x = 64.0 - x;
+            }
+            let (ix, iy) = m.apply(x, y);
+            out[k] = [ix, iy];
+        }
+        Ok(out)
+    }
+}

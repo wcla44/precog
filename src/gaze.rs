@@ -6,9 +6,12 @@ use nalgebra::{DMatrix, DVector};
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::path::Path;
 
 pub const NF: usize = 14;
+/// Bumped whenever the feature vector changes meaning: older saved models then trigger a recalibration.
+pub const FEATURE_VERSION: u32 = 2;
 /// Columns that get squared / crossed: iris x,y of both eyes, pitch, yaw.
 const QUAD: [usize; 6] = [0, 1, 3, 4, 6, 7];
 const ALPHAS: [f64; 5] = [0.01, 0.1, 1.0, 10.0, 100.0];
@@ -17,6 +20,8 @@ pub const CLICK_GROUP: i64 = 1000;
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct GazeModel {
+    #[serde(default)]
+    pub version: u32,
     pub f: Vec<[f64; NF]>,
     pub y: Vec<[f64; 2]>,
     pub g: Vec<i64>,
@@ -176,43 +181,150 @@ impl GazeModel {
     }
 }
 
-/// One-euro filter: smooth when still, responsive when moving.
-pub struct OneEuro {
-    min_cutoff: f64,
-    beta: f64,
-    d_cutoff: f64,
-    state: Option<([f64; 2], [f64; 2], f64)>,
+/// Fixation-aware gaze filter. Webcam gaze is noisy (~100-200 px per sample), and eyes move in two ways:
+/// fixations (still, where averaging is right) and saccades (fast jumps, where averaging = lag).
+/// Samples close to the current fixation are averaged; a few consecutive samples that agree on a new spot
+/// end the fixation immediately (2 frames for big jumps, 3 otherwise), so the output never trails behind the eye.
+pub struct FixationFilter {
+    center: Option<[f64; 2]>,
+    inliers: VecDeque<[f64; 2]>,
+    pending: Vec<[f64; 2]>,
+    outliers_in_a_row: u32,
+    jitter: f64,
+    shown: Option<[f64; 2]>,
+    last_t: f64,
 }
 
-impl OneEuro {
-    pub fn new() -> Self {
-        Self { min_cutoff: 0.6, beta: 0.004, d_cutoff: 1.0, state: None }
+fn dist(a: [f64; 2], b: [f64; 2]) -> f64 {
+    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
+}
+
+fn mean(pts: impl IntoIterator<Item = [f64; 2]>) -> [f64; 2] {
+    let (mut s, mut n) = ([0.0f64; 2], 0.0f64);
+    for p in pts {
+        s[0] += p[0];
+        s[1] += p[1];
+        n += 1.0;
+    }
+    [s[0] / n.max(1.0), s[1] / n.max(1.0)]
+}
+
+impl FixationFilter {
+    const MAX_INLIERS: usize = 12; // ~0.4 s of averaging at 30 fps
+    const EASE: f64 = 0.035; // s: display easing, just enough to avoid a teleport flicker
+
+    pub fn new(initial_jitter: f64) -> Self {
+        Self {
+            center: None,
+            inliers: VecDeque::new(),
+            pending: Vec::new(),
+            outliers_in_a_row: 0,
+            jitter: initial_jitter.clamp(30.0, 250.0),
+            shown: None,
+            last_t: 0.0,
+        }
     }
 
-    fn alpha(cutoff: f64, dt: f64) -> f64 {
-        let r = 2.0 * std::f64::consts::PI * cutoff * dt;
-        r / (r + 1.0)
+    /// Estimated per-sample noise in px (mean distance of fixation samples to their centre).
+    pub fn jitter(&self) -> f64 {
+        self.jitter
     }
 
-    pub fn filter(&mut self, x: [f64; 2], t: f64) -> [f64; 2] {
-        let Some((px, pdx, pt)) = self.state else {
-            self.state = Some((x, [0.0; 2], t));
-            return x;
-        };
-        let dt = (t - pt).max(1e-3);
-        let ad = Self::alpha(self.d_cutoff, dt);
-        let dx = [pdx[0] + ad * ((x[0] - px[0]) / dt - pdx[0]), pdx[1] + ad * ((x[1] - px[1]) / dt - pdx[1])];
-        let cutoff = self.min_cutoff + self.beta * (dx[0].powi(2) + dx[1].powi(2)).sqrt();
-        let a = Self::alpha(cutoff, dt);
-        let nx = [px[0] + a * (x[0] - px[0]), px[1] + a * (x[1] - px[1])];
-        self.state = Some((nx, dx, t));
-        nx
+    fn radius(&self) -> f64 {
+        (2.5 * self.jitter).clamp(60.0, 450.0)
+    }
+
+    fn start(&mut self, pts: &[[f64; 2]]) {
+        self.inliers = pts.iter().copied().collect();
+        self.center = Some(mean(pts.iter().copied()));
+        self.pending.clear();
+        self.outliers_in_a_row = 0;
+    }
+
+    pub fn reset(&mut self) {
+        self.center = None;
+        self.shown = None;
+        self.inliers.clear();
+        self.pending.clear();
+    }
+
+    pub fn update(&mut self, p: [f64; 2], t: f64) -> [f64; 2] {
+        let r = self.radius();
+        match self.center {
+            None => self.start(&[p]),
+            Some(c) if dist(p, c) <= r => {
+                self.jitter = 0.98 * self.jitter + 0.02 * dist(p, c).max(5.0);
+                self.inliers.push_back(p);
+                while self.inliers.len() > Self::MAX_INLIERS {
+                    self.inliers.pop_front();
+                }
+                self.center = Some(mean(self.inliers.iter().copied()));
+                self.pending.clear();
+                self.outliers_in_a_row = 0;
+            }
+            Some(c) => {
+                self.pending.push(p);
+                self.outliers_in_a_row += 1;
+                let m = mean(self.pending.iter().copied());
+                let agree = self.pending.iter().all(|&q| dist(q, m) <= r);
+                let far = dist(m, c) > 2.0 * r;
+                if agree && (self.pending.len() >= 3 || (far && self.pending.len() >= 2)) {
+                    let pts = std::mem::take(&mut self.pending);
+                    self.start(&pts); // saccade: jump now
+                } else if !agree && self.pending.len() >= 3 {
+                    self.pending.remove(0);
+                }
+                if self.outliers_in_a_row >= 6 {
+                    // noisier than we thought: widen the fixation window and re-anchor
+                    self.jitter = (self.jitter * 1.25).min(250.0);
+                    let pts: Vec<_> = self.pending.iter().rev().take(3).copied().collect();
+                    self.start(&pts);
+                }
+            }
+        }
+        let c = self.center.unwrap();
+        let shown = self.shown.get_or_insert(c);
+        let a = 1.0 - (-(t - self.last_t).max(0.0) / Self::EASE).exp();
+        shown[0] += a * (c[0] - shown[0]);
+        shown[1] += a * (c[1] - shown[1]);
+        self.last_t = t;
+        *shown
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Noisy fixations with a saccade: steady during fixations, follows the jump within ~3 frames.
+    #[test]
+    fn fixation_filter() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        use rand::Rng;
+        let mut f = FixationFilter::new(100.0);
+        let dt = 1.0 / 30.0;
+        let (mut moves, mut last) = (Vec::new(), None::<[f64; 2]>);
+        let mut lag = None;
+        for i in 0..240 {
+            let t = i as f64 * dt;
+            let target = if i < 120 { [400.0, 300.0] } else { [1200.0, 700.0] };
+            let p = [target[0] + rng.random_range(-110.0..110.0), target[1] + rng.random_range(-110.0..110.0)];
+            let o = f.update(p, t);
+            if (30..120).contains(&i) {
+                if let Some(l) = last {
+                    moves.push(dist(o, l));
+                }
+            }
+            if i >= 120 && lag.is_none() && dist(o, target) < 100.0 {
+                lag = Some((i - 120) as f64 * dt);
+            }
+            last = Some(o);
+        }
+        let m = moves.iter().sum::<f64>() / moves.len() as f64;
+        println!("fixation motion {m:.1} px/frame, saccade lag {:?} s", lag);
+        assert!(m < 12.0, "too jumpy during fixation: {m}");
+        assert!(lag.is_some_and(|l| l <= 0.2), "saccade lag {lag:?}");
+    }
 
     #[test]
     fn fits_synthetic() {

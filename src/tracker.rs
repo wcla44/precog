@@ -4,7 +4,7 @@
 use crate::gaze::NF;
 use crate::gestures::{classify, Pose, Swipe, SwipeDetector};
 use crate::now;
-use crate::vision::{FaceMesh, HandTracker, Rgb};
+use crate::vision::{FaceMesh, HandTracker, IrisModel, Rgb};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -16,6 +16,8 @@ pub struct Frame {
     pub t: f64,
     pub features: Option<[f64; NF]>,
     pub pose: Option<Pose>,
+    /// Raw face landmarks (478 x [x, y, z], iris centres refined) + [w, h]: saved with calibrations for offline tuning.
+    pub raw: Option<Arc<Vec<f32>>>,
 }
 
 #[derive(Default)]
@@ -48,7 +50,22 @@ fn eye_features(p: &[[f32; 3]], (c1, c2, top, bot, iris): (usize, usize, usize, 
     [((dx * ux + dy * uy) / n) as f64, ((-dx * uy + dy * ux) / n) as f64, open as f64]
 }
 
-/// 14 features: iris offsets + eyelid openness for both eyes, head pose (2D geometry + depth), face position/scale.
+fn norm3(v: [f32; 3]) -> [f32; 3] {
+    let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-6);
+    [v[0] / n, v[1] / n, v[2] / n]
+}
+
+/// Head yaw / pitch from the face's own 3D axes (eye line, forehead->chin line), insensitive to 2D foreshortening.
+fn head_angles_3d(p: &[[f32; 3]]) -> (f32, f32) {
+    let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let x = norm3(sub(p[263], p[33]));
+    let down = sub(p[152], p[10]);
+    let d = down[0] * x[0] + down[1] * x[1] + down[2] * x[2];
+    let y = norm3([down[0] - d * x[0], down[1] - d * x[1], down[2] - d * x[2]]);
+    (y[2].clamp(-1.0, 1.0).asin(), x[2].clamp(-1.0, 1.0).asin()) // (pitch, yaw)
+}
+
+/// 14 features: iris offsets + eyelid openness for both eyes, head pose (3D axes + 2D geometry), face position/scale.
 pub fn features(p: &[[f32; 3]], w: usize, h: usize) -> [f64; NF] {
     let [rx, ry, ro] = eye_features(p, EYES[0]);
     let [lx, ly, lo] = eye_features(p, EYES[1]);
@@ -61,15 +78,14 @@ pub fn features(p: &[[f32; 3]], w: usize, h: usize) -> [f64; NF] {
     let face_h = (chin.1 - forehead.1).abs().max(1e-6);
     let yaw = (nose.0 - (cl.0 + cr.0) / 2.0) / face_w;
     let pitch = (nose.1 - (forehead.1 + chin.1) / 2.0) / face_h;
-    let yaw_z = (p[454][2] - p[234][2]) / face_w;
-    let pitch_z = (p[152][2] - p[10][2]) / face_h;
+    let (pitch3, yaw3) = head_angles_3d(p);
     let cx = (p[234][0] + p[454][0]) / 2.0 / w as f32 - 0.5;
     let cy = (p[10][1] + p[152][1]) / 2.0 / h as f32 - 0.5;
     [
         rx, ry, ro, lx, ly, lo,
-        pitch as f64, yaw as f64, roll as f64,
+        pitch3 as f64, yaw3 as f64, roll as f64,
         cx as f64, cy as f64, (face_w / w as f32) as f64,
-        yaw_z as f64, pitch_z as f64,
+        yaw as f64, pitch as f64,
     ]
 }
 
@@ -97,6 +113,10 @@ impl Tracker {
         self.shared.lock().latest.clone()
     }
 
+    pub fn raw_between(&self, t0: f64, t1: f64) -> Vec<Arc<Vec<f32>>> {
+        self.shared.lock().history.iter().filter(|f| f.t >= t0 && f.t <= t1).filter_map(|f| f.raw.clone()).collect()
+    }
+
     pub fn features_between(&self, t0: f64, t1: f64) -> Vec<[f64; NF]> {
         self.shared.lock().history.iter().filter(|f| f.t >= t0 && f.t <= t1).filter_map(|f| f.features).collect()
     }
@@ -111,6 +131,7 @@ fn run(
     mirrored: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let mut face = FaceMesh::new(models)?;
+    let mut iris = IrisModel::new(models).map_err(|e| eprintln!("iris model unavailable ({e:#}): using face-mesh iris")).ok();
     let mut hands: Option<HandTracker> = None;
     let cam = Cam::open(camera).map_err(|e| {
         anyhow::anyhow!("{e:#}. Grant Camera access to your terminal app (macOS: System Settings > Privacy & Security > Camera)")
@@ -123,7 +144,18 @@ fn run(
         let t = now();
         let (w, h) = (img.width, img.height);
         let rgb = Rgb { w, h, data: &img.data };
-        let feats = face.process(&rgb)?.map(|p| features(&p, w, h));
+        let mut mesh = face.process(&rgb)?;
+        if let (Some(p), Some(iris)) = (mesh.as_mut(), iris.as_mut()) {
+            let [r, l] = iris.process(&rgb, p)?;
+            p[468][..2].copy_from_slice(&r);
+            p[473][..2].copy_from_slice(&l);
+        }
+        let feats = mesh.as_ref().map(|p| features(p, w, h));
+        let raw = mesh.map(|p| {
+            let mut v: Vec<f32> = p.iter().flatten().copied().collect();
+            v.extend([w as f32, h as f32]);
+            Arc::new(v)
+        });
 
         if use_hands.load(Ordering::Relaxed) {
             if hands.is_none() {
@@ -143,7 +175,7 @@ fn run(
             pose = None;
         }
 
-        let f = Frame { t, features: feats, pose };
+        let f = Frame { t, features: feats, pose, raw };
         {
             let mut s = shared.lock();
             s.history.push_back(f.clone());

@@ -69,9 +69,13 @@ fn main() -> anyhow::Result<()> {
         let dir = paths::onnx_dir();
         let face = vision::FaceMesh::new(&dir)?.process(&rgb)?;
         let hand = vision::HandTracker::new(&dir)?.process(&rgb)?;
+        let iris = match &face {
+            Some(p) => Some(vision::IrisModel::new(&dir)?.process(&rgb, p)?),
+            None => None,
+        };
         let feats = face.as_ref().map(|p| tracker::features(p, w, h).to_vec());
         let pose = hand.as_ref().map(|p| format!("{:?}", gestures::classify(&p.iter().map(|q| [q[0], q[1]]).collect::<Vec<_>>())));
-        println!("{}", serde_json::json!({"face": face, "hand": hand, "features": feats, "pose": pose}));
+        println!("{}", serde_json::json!({"face": face, "hand": hand, "iris": iris, "features": feats, "pose": pose}));
         return Ok(());
     }
     if args.test_llm {
