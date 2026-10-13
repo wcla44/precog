@@ -13,9 +13,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::Path;
 
-pub const NF: usize = 14;
+/// Landmark features (`tracker::features`), then two 60-pixel eye patches (`vision::eye_patches`).
+pub const LAND: usize = 20;
+pub const NF: usize = LAND + 2 * crate::vision::EYE_PATCH;
 /// Bumped whenever the feature vector changes meaning: older saved models then trigger a recalibration.
-pub const FEATURE_VERSION: u32 = 5;
+pub const FEATURE_VERSION: u32 = 7;
 /// Columns that get squared / crossed: iris x,y of both eyes, head pitch/yaw.
 const QUAD: [usize; 6] = [0, 1, 3, 4, 6, 7];
 const ALPHAS: [f64; 5] = [0.01, 0.1, 1.0, 10.0, 100.0];
@@ -24,6 +26,9 @@ const MAX_CLICK_SAMPLES: usize = 3000;
 const CLICK_RECENCY_S: f64 = 1800.0;
 const CLICK_RECENCY_FLOOR: f64 = 0.25;
 pub const CLICK_GROUP: i64 = 1000;
+/// Geometric model: the eye-in-head features it regresses from (iris offsets + eyelid openness of both eyes, head
+/// pitch / yaw); the head position and rotation enter through the geometry.
+const GEO_DIM: usize = 8;
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct GazeModel {
@@ -44,6 +49,18 @@ pub struct GazeModel {
     pub alpha: f64,
     /// Monitors (left, top, w, h) it was calibrated on.
     pub layout: Vec<(i32, i32, u32, u32)>,
+    /// Physical arrangement of the screens: the regression runs in mm (targets stay in pixels, `y`). None = pixels.
+    #[serde(default)]
+    pub phys: Option<crate::layout::Physical>,
+    /// Geometric model (landmark features only): the regression predicts the gaze direction in the head frame and
+    /// the screen point is where that ray meets the screens (see `geo`). Takes precedence over `phys`.
+    #[serde(default)]
+    pub geo: Option<crate::geo::Geo>,
+    #[serde(skip)]
+    pub opts: FitOpts,
+    /// Camera focal length (px at 1280 px width) the features were computed with (set by the calibration).
+    #[serde(default)]
+    pub focal: Option<f64>,
     #[serde(skip)]
     fit: Option<Fit>,
 }
@@ -58,6 +75,27 @@ struct Fit {
     stretch: [(f64, f64); 2],
 }
 
+/// Fitting variants (compared offline with `--replay` on recorded calibrations).
+#[derive(Clone, Copy, Debug)]
+pub struct FitOpts {
+    /// Geometric model: undo ridge shrinkage on the predicted angles (the gaze "not reaching" the edges).
+    pub stretch_angles: bool,
+    /// Geometric model: keep the screens' poses and the depth scale physically plausible (tilt within 25 deg,
+    /// depth scale, i.e. focal length relative to the assumed one, 0.45-2.2, offsets within 250 mm).
+    pub bounded: bool,
+    /// Add the eye patch pixels to the regression (WebGazer's features): their appearance carries the vertical gaze.
+    pub eye_patches: bool,
+}
+
+/// Defaults from replayed real calibrations (dots train, pursuit tests; validation dots never learned from):
+/// bounded geometry cut the error from 582 to 483 px; the eye patches from 329 to 219 px (vertical reach 0.36 ->
+/// 0.62, validation 373 -> 324 px); the angle stretch did not help.
+impl Default for FitOpts {
+    fn default() -> Self {
+        Self { stretch_angles: false, bounded: true, eye_patches: true }
+    }
+}
+
 /// Least-squares target = offset + gain * prediction on one axis, gain limited to [1, 1.6]: only ever expands.
 fn stretch_axis(pairs: &[([f64; 2], [f64; 2])], axis: usize) -> (f64, f64) {
     let n = pairs.len() as f64;
@@ -70,6 +108,22 @@ fn stretch_axis(pairs: &[([f64; 2], [f64; 2])], axis: usize) -> (f64, f64) {
     let var = pairs.iter().map(|p| (p.0[axis] - mp).powi(2)).sum::<f64>().max(1e-9);
     let gain = (cov / var).clamp(1.0, 1.6);
     (mt - gain * mp, gain)
+}
+
+/// Face position in the camera image (centre x, centre y, width; see `tracker::features`): where the user sits
+/// relative to the camera. Moving on the chair or tilting a laptop lid (with its camera) changes it.
+const HEAD: [usize; 3] = [9, 10, 11];
+
+/// Mean face position of some landmark feature vectors.
+pub fn head_of<F: AsRef<[f64]>>(feats: &[F]) -> [f64; 3] {
+    let n = feats.len().max(1) as f64;
+    HEAD.map(|i| feats.iter().map(|f| f.as_ref()[i]).sum::<f64>() / n)
+}
+
+/// How far the user sits from a reference posture: about 1 = moved enough that the gaze is probably off.
+pub fn head_shift(reference: [f64; 3], x: &[f64]) -> f64 {
+    let [cx, cy, w] = HEAD.map(|i| x[i]);
+    ((cx - reference[0]).abs() / 0.06).max((cy - reference[1]).abs() / 0.06).max((w / reference[2].max(1e-3) - 1.0).abs() / 0.12)
 }
 
 pub fn unix_now() -> f64 {
@@ -89,6 +143,36 @@ impl GazeModel {
 
     pub fn ready(&self) -> bool {
         self.fit.is_some()
+    }
+
+    /// Follow a change of screens (plugged, unplugged, moved in the system layout), geometric model only: known
+    /// screens keep their pose, every sample moves to the same physical spot in the new layout (dropped if its screen
+    /// is gone), the per-user regression is kept. Returns the new screens, whose pose needs a calibration.
+    pub fn adapt_to(&mut self, mons: &[crate::monitors::Monitor]) -> Result<Vec<crate::monitors::Monitor>> {
+        let Some(old) = self.geo.clone() else { bail!("not a geometric model") };
+        let (geo, new_screens) = old.adapt(mons);
+        let moved: Vec<Option<[f64; 2]>> = self.y.iter().map(|t| geo.locate(old.point(t[0], t[1])).map(|(x, y)| [x, y])).collect();
+        let keep: Vec<bool> = moved.iter().map(|m| m.is_some()).collect();
+        let mut i = 0;
+        self.f.retain(|_| (keep[i], i += 1).0);
+        (i, self.y) = (0, moved.into_iter().flatten().collect());
+        self.g.retain(|_| (keep[i], i += 1).0);
+        i = 0;
+        self.w.retain(|_| (keep[i], i += 1).0);
+        i = 0;
+        self.ts.retain(|_| (keep.get(i).copied().unwrap_or(true), i += 1).0);
+        self.geo = Some(geo);
+        self.layout = mons.iter().map(|m| m.layout()).collect();
+        if self.len() >= 30 {
+            self.refit()?;
+        }
+        Ok(new_screens)
+    }
+
+    /// Posture of the explicit calibration samples (landmark models only).
+    pub fn calibrated_head(&self) -> Option<[f64; 3]> {
+        let feats: Vec<&Vec<f64>> = self.f.iter().zip(&self.g).filter(|(_, &g)| g < CLICK_GROUP).map(|(f, _)| f).collect();
+        (self.dim == NF && !feats.is_empty()).then(|| head_of(&feats))
     }
 
     pub fn cv_error(&self) -> f64 {
@@ -135,6 +219,140 @@ impl GazeModel {
             i = 0;
             self.ts.retain(|_| (keep[i], i += 1).0);
         }
+    }
+
+    /// Regression inputs of one sample: the eye-in-head features in the geometric model, all features otherwise.
+    fn row(&self, mu: &[f64], sd: &[f64], x: &[f64]) -> Vec<f64> {
+        let mut row = if self.geo.is_some() {
+            Self::expand(&QUAD, &mu[..GEO_DIM], &sd[..GEO_DIM], &x[..GEO_DIM])
+        } else {
+            let d = self.dim.min(LAND); // landmark (and UniGaze) features; the patches only when asked
+            Self::expand(&self.quad, &mu[..d], &sd[..d], &x[..d])
+        };
+        if self.opts.eye_patches && self.dim == NF {
+            row.extend((LAND..NF).map(|i| (x[i] - mu[i]) / sd[i]));
+        }
+        row
+    }
+
+    /// Fit the screens' 3D poses and the depth scale of the geometric model to the samples. Each plausible
+    /// arrangement (`layout::Physical::candidates`, the system's own first) is a starting point refined by
+    /// Nelder-Mead on the cross-validated error; the system's arrangement is kept unless another one is clearly
+    /// better (it is context, not truth). Returns the error (px) and a description.
+    pub fn fit_geometry(&mut self, mons: &[crate::monitors::Monitor]) -> Result<(f64, String)> {
+        use crate::geo::Geo;
+        use crate::layout::Physical;
+        let mons = &crate::monitors::camera_first(mons);
+        let n = self.f.len();
+        if n < 30 || self.dim != NF {
+            bail!("not enough samples ({n})");
+        }
+        // ridge strength for the search: picked by cross-validation on the system arrangement (a fixed, too strong
+        // one shrinks the predicted angles, and the search then compensates by distorting the geometry)
+        self.geo = Some(Geo::new(&Physical::candidates(mons)[0], mons, 1.0, vec![[0.0; 4]; mons.len().saturating_sub(1)]));
+        self.fit()?;
+        let alpha = self.alpha;
+        self.ts.resize(n, unix_now());
+        let w = self.weights();
+        let mut mu = vec![0.0; NF];
+        let mut sd = vec![0.0; NF];
+        for i in 0..NF {
+            mu[i] = self.f.iter().map(|x| x[i]).sum::<f64>() / n as f64;
+            sd[i] = (self.f.iter().map(|x| (x[i] - mu[i]).powi(2)).sum::<f64>() / n as f64).sqrt() + 1e-6;
+        }
+        let rows: Vec<Vec<f64>> = self.f.iter().map(|x| self.row(&mu, &sd, x)).collect();
+        let x = DMatrix::from_fn(n, rows[0].len(), |r, c| rows[r][c]);
+        let mut groups: Vec<i64> = self.g.clone();
+        groups.sort_unstable();
+        groups.dedup();
+        groups.shuffle(&mut rand::rngs::StdRng::seed_from_u64(0));
+        let k = groups.len().min(4);
+        let folds: Vec<(Vec<usize>, Vec<usize>)> = (0..k)
+            .map(|i| {
+                let fold: Vec<i64> = groups.iter().skip(i).step_by(k).copied().collect();
+                (0..n).partition(|&r| !fold.contains(&self.g[r]))
+            })
+            .collect();
+        let cv = |geo: &Geo| -> f64 {
+            let y = DMatrix::from_fn(n, 2, |r, c| geo.angles_to(&self.f[r], self.y[r][0], self.y[r][1])[c]);
+            let mut errs = Vec::with_capacity(n);
+            for (tr, te) in &folds {
+                let Some(c) = Self::solve(&x, &y, &w, tr, alpha) else { return f64::INFINITY };
+                for &r in te {
+                    let p = x.row(r) * &c;
+                    let e = geo.hit(&self.f[r], [p[0], p[1]]).map_or(1e5, |(px, py)| (px - self.y[r][0]).hypot(py - self.y[r][1]));
+                    errs.push(if e.is_finite() { e } else { 1e5 });
+                }
+            }
+            // mean of the best 80%: smoother than the median for the simplex search, still robust to outliers
+            errs.sort_by(f64::total_cmp);
+            let keep = &errs[..(errs.len() * 4 / 5).max(1)];
+            keep.iter().sum::<f64>() / keep.len() as f64
+        };
+        let n_sec = mons.len().saturating_sub(1);
+        // parameters in natural units: ln(depth scale); per other screen right / down / towards the user (100 mm)
+        // and tilt (0.3 rad)
+        let bounded = self.opts.bounded;
+        let squash = |v: f64, lim: f64| if bounded { lim * (v / lim).tanh() } else { v };
+        let build = |phys: &Physical, p: &[f64]| {
+            let params = (0..n_sec)
+                .map(|i| {
+                    let mm = |k: usize| squash(p[k + 4 * i] * 100.0, 250.0);
+                    [mm(1), mm(2), mm(3), squash(p[4 + 4 * i] * 0.3, 25f64.to_radians())]
+                })
+                .collect();
+            // the depth scale is the camera focal length relative to the assumed one (PnP depth scales with it):
+            // webcams range from narrow to wide, so it gets a wide range (0.45-2.2)
+            Geo::new(phys, mons, squash(p[0], 0.8).exp(), params)
+        };
+        let all: Vec<usize> = (0..n).collect();
+        // Levenberg-Marquardt on the training residuals (px): for given screen poses the angle regression has a
+        // closed form, so the residuals are a smooth function of the poses. Pseudo-Huber (150 px) against outlier
+        // frames, and a weak prior pulling towards the starting arrangement.
+        let residuals = |phys: &Physical, p: &[f64]| -> Vec<f64> {
+            let geo = build(phys, p);
+            let y = DMatrix::from_fn(n, 2, |r, c| geo.angles_to(&self.f[r], self.y[r][0], self.y[r][1])[c]);
+            let mut out = Vec::with_capacity(2 * n + p.len());
+            let Some(c) = Self::solve(&x, &y, &w, &all, alpha) else { return vec![1e5; 2 * n + p.len()] };
+            for r in 0..n {
+                let q = x.row(r) * &c;
+                let (hx, hy) = geo.hit(&self.f[r], [q[0], q[1]]).unwrap_or((1e5, 1e5));
+                for e in [hx - self.y[r][0], hy - self.y[r][1]] {
+                    let e = if e.is_finite() { e } else { 1e5 };
+                    out.push(w[r].sqrt() * e / (1.0 + (e / 150.0).powi(2)).powf(0.25));
+                }
+            }
+            let scale = (n as f64).sqrt() * 5.0;
+            out.extend(p.iter().map(|v| v * scale));
+            out
+        };
+        let candidates = Physical::candidates(mons);
+        let zero = vec![0.0; 1 + 4 * n_sec];
+        let mut start: Vec<(f64, usize)> = candidates.iter().enumerate().map(|(i, c)| (cv(&build(c, &zero)), i)).collect();
+        let system_start = start[0];
+        start[1..].sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut results: Vec<(f64, Geo)> = Vec::new();
+        for &(_, i) in std::iter::once(&system_start).chain(start[1..].iter().take(2)) {
+            let phys = &candidates[i];
+            let p = levenberg_marquardt(|p| residuals(phys, p), &zero, 30);
+            let geo = build(phys, &p);
+            results.push((cv(&geo), geo));
+        }
+        let system = results[0].clone();
+        let best = results.iter().min_by(|a, b| a.0.total_cmp(&b.0)).cloned().unwrap_or_else(|| system.clone());
+        let (err, geo) = if best.0 < 0.85 * system.0 { best } else { system };
+        let describe = format!(
+            "{} (camera focal ~{:.0} px at 1280 px width{})",
+            if geo.label.is_empty() { "single screen" } else { &geo.label },
+            1000.0 * geo.depth_scale,
+            geo.params
+                .iter()
+                .map(|q| format!("; other screen moved {:+.0}/{:+.0}/{:+.0} mm, tilted {:+.0} deg", q[0], q[1], q[2], q[3].to_degrees()))
+                .collect::<String>()
+        );
+        self.geo = Some(geo);
+        self.phys = None;
+        Ok((err, describe))
     }
 
     fn expand(quad: &[usize], mu: &[f64], sd: &[f64], x: &[f64]) -> Vec<f64> {
@@ -207,10 +425,21 @@ impl GazeModel {
             mu[i] = self.f.iter().map(|x| x[i]).sum::<f64>() / n as f64;
             sd[i] = (self.f.iter().map(|x| (x[i] - mu[i]).powi(2)).sum::<f64>() / n as f64).sqrt() + 1e-6;
         }
-        let rows: Vec<Vec<f64>> = self.f.iter().map(|x| Self::expand(&self.quad, &mu, &sd, x)).collect();
+        let rows: Vec<Vec<f64>> = self.f.iter().map(|x| self.row(&mu, &sd, x)).collect();
         let p = rows[0].len();
         let x = DMatrix::from_fn(n, p, |r, c| rows[r][c]);
-        let y = DMatrix::from_fn(n, 2, |r, c| self.y[r][c]);
+        // regress gaze angles (geometric model), or physical mm, or pixels
+        let target: Vec<[f64; 2]> = match (&self.geo, &self.phys) {
+            (Some(g), _) => self.f.iter().zip(&self.y).map(|(f, t)| g.angles_to(f, t[0], t[1])).collect(),
+            (None, Some(ph)) => self.y.iter().map(|t| ph.to_mm(t[0], t[1])).map(|(a, b)| [a, b]).collect(),
+            (None, None) => self.y.clone(),
+        };
+        let y = DMatrix::from_fn(n, 2, |r, c| target[r][c]);
+        let to_px = |r: usize, p: [f64; 2]| match (&self.geo, &self.phys) {
+            (Some(g), _) => g.hit(&self.f[r], p).unwrap_or((f64::NAN, f64::NAN)),
+            (None, Some(ph)) => ph.to_px(p[0], p[1]),
+            (None, None) => (p[0], p[1]),
+        };
 
         let all: Vec<usize> = (0..n).collect();
         if !cross_validate && self.alpha > 0.0 {
@@ -236,7 +465,9 @@ impl GazeModel {
                 let Some(c) = Self::solve(&x, &y, &w, &tr, alpha) else { continue };
                 for r in te {
                     let pred = x.row(r) * &c;
-                    errs.push(((pred[0] - y[(r, 0)]).powi(2) + (pred[1] - y[(r, 1)]).powi(2)).sqrt());
+                    let (px, py) = to_px(r, [pred[0], pred[1]]); // errors in pixels, whatever the regression space
+                    let e = (px - self.y[r][0]).hypot(py - self.y[r][1]);
+                    errs.push(if e.is_finite() { e } else { 1e5 });
                     held_out.push(([pred[0], pred[1]], [y[(r, 0)], y[(r, 1)]]));
                 }
             }
@@ -251,17 +482,25 @@ impl GazeModel {
         }
         let Some(coef) = Self::solve(&x, &y, &w, &all, best.1) else { bail!("singular system") };
         self.alpha = best.1;
-        let stretch = [0, 1].map(|a| stretch_axis(&best.2, a));
+        // the stretch undoes ridge shrinkage in screen space; angles go through the geometry instead
+        let stretch = if self.geo.is_some() && !self.opts.stretch_angles { [(0.0, 1.0); 2] } else { [0, 1].map(|a| stretch_axis(&best.2, a)) };
         self.fit = Some(Fit { mu, sd, coef, cv_error: best.0, stretch });
         Ok(best.0)
     }
 
     pub fn predict(&self, x: &[f64]) -> Option<(f64, f64)> {
         let f = self.fit.as_ref()?;
-        let row = DVector::from_vec(Self::expand(&self.quad, &f.mu, &f.sd, x));
+        let row = DVector::from_vec(self.row(&f.mu, &f.sd, x));
         let p = row.transpose() * &f.coef;
         let [(ox, gx), (oy, gy)] = f.stretch;
-        Some((ox + gx * p[0], oy + gy * p[1]))
+        if let Some(g) = &self.geo {
+            return g.hit(x, [ox + gx * p[0], oy + gy * p[1]]);
+        }
+        let (px, py) = (ox + gx * p[0], oy + gy * p[1]);
+        Some(match &self.phys {
+            Some(ph) => ph.to_px(px, py),
+            None => (px, py),
+        })
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -284,6 +523,57 @@ impl GazeModel {
         m.fit()?;
         Ok(m)
     }
+}
+
+/// Least squares: minimise |r(x)|^2 from `x0` with Levenberg-Marquardt (numeric Jacobian).
+pub fn levenberg_marquardt(r: impl Fn(&[f64]) -> Vec<f64>, x0: &[f64], iters: usize) -> Vec<f64> {
+    let d = x0.len();
+    let mut x = x0.to_vec();
+    let mut e = r(&x);
+    let mut cost: f64 = e.iter().map(|v| v * v).sum();
+    let mut lambda = 1e-2;
+    for _ in 0..iters {
+        let m = e.len();
+        let mut j = DMatrix::<f64>::zeros(m, d);
+        for k in 0..d {
+            let mut xp = x.clone();
+            xp[k] += 1e-4;
+            let ep = r(&xp);
+            for i in 0..m {
+                j[(i, k)] = (ep[i] - e[i]) / 1e-4;
+            }
+        }
+        let ev = DVector::from_vec(e.clone());
+        let jtj = j.transpose() * &j;
+        let jte = j.transpose() * ev;
+        let mut improved = false;
+        for _ in 0..8 {
+            let mut a = jtj.clone();
+            for k in 0..d {
+                a[(k, k)] *= 1.0 + lambda;
+                a[(k, k)] += 1e-9;
+            }
+            let Some(step) = a.cholesky().map(|c| c.solve(&jte)) else { break };
+            let xn: Vec<f64> = (0..d).map(|k| x[k] - step[k]).collect();
+            let en = r(&xn);
+            let cn: f64 = en.iter().map(|v| v * v).sum();
+            if cn < cost {
+                let small = step.norm() < 1e-6;
+                (x, e, cost) = (xn, en, cn);
+                lambda = (lambda * 0.3).max(1e-7);
+                improved = true;
+                if small {
+                    return x;
+                }
+                break;
+            }
+            lambda *= 10.0;
+        }
+        if !improved {
+            break;
+        }
+    }
+    x
 }
 
 /// Instant local correction from recent clicks: residual = click position - model prediction, blended by
@@ -532,6 +822,95 @@ mod tests {
         let after = err(&m, &corr, &mut rng);
         println!("mean error after drift: {before:.0}px -> after 15 clicks: {after:.0}px");
         assert!(after < before * 0.5, "{before} -> {after}");
+    }
+
+    /// Simulated user: true screens differ from the system layout (external monitor shifted, pushed back, tilted),
+    /// the head moves and turns, iris features respond to the true eye-in-head angles. The geometric model must
+    /// recover the geometry and stay accurate at new head positions, where a pixel regression fails.
+    #[test]
+    fn geometric_model_handles_head_movement() {
+        use crate::geo::Geo;
+        use crate::layout::Physical;
+        use crate::monitors::Monitor;
+        use nalgebra::{Rotation3, Vector3};
+        use rand::Rng;
+        let mons = vec![
+            Monitor { left: 0, top: 1440, width: 1920, height: 1080, primary: true, mm: Some((294.0, 165.0)), builtin: true },
+            Monitor { left: 0, top: 0, width: 2560, height: 1440, primary: false, mm: Some((597.0, 336.0)), builtin: false },
+        ];
+        let truth = Geo::new(&Physical::candidates(&mons)[0], &mons, 1.0, vec![[60.0, -20.0, -150.0, 0.2]]);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        // one sample: features for a user at `eye`, head rotated `rv`, looking at (x, y)
+        let sample = |rng: &mut rand::rngs::StdRng, x: f64, y: f64, eye: [f64; 3], rv: [f64; 3]| {
+            let mut f = vec![0.0; NF];
+            f[14..17].copy_from_slice(&rv);
+            f[17..20].copy_from_slice(&eye);
+            let [yaw, pitch] = truth.angles_to(&f, x, y);
+            let r = Rotation3::new(Vector3::new(rv[0], rv[1], rv[2]));
+            let (hp, hy, _) = r.euler_angles();
+            let noise = |rng: &mut rand::rngs::StdRng| rng.random_range(-0.004..0.004);
+            // iris offsets ~ sin of the eye rotation (eye width units), lids open with upward gaze
+            f[0] = 0.35 * yaw.sin() + noise(rng);
+            f[1] = 0.30 * pitch.sin() + noise(rng);
+            f[2] = 0.30 - 0.1 * pitch;
+            f[3] = 0.35 * yaw.sin() + noise(rng);
+            f[4] = 0.30 * pitch.sin() + noise(rng);
+            f[5] = 0.30 - 0.1 * pitch;
+            f[6] = hp;
+            f[7] = hy;
+            f
+        };
+        let head = |rng: &mut rand::rngs::StdRng, spread: f64| {
+            let eye = [rng.random_range(-spread..spread), rng.random_range(40.0..120.0), rng.random_range(500.0..700.0)];
+            let rv = [rng.random_range(-0.15..0.15), rng.random_range(-0.15..0.15), rng.random_range(-0.05..0.05)];
+            (eye, rv)
+        };
+        let mut m = GazeModel::landmarks();
+        for (g, (mi, fx, fy)) in [0usize, 1].iter().flat_map(|&mi| (0..9).map(move |k| (mi, 0.05 + 0.45 * (k % 3) as f64, 0.05 + 0.45 * (k / 3) as f64))).enumerate() {
+            let mo = mons[mi];
+            let (x, y) = (mo.left as f64 + fx * mo.width as f64, mo.top as f64 + fy * mo.height as f64);
+            let (eye, rv) = head(&mut rng, 80.0);
+            let feats: Vec<Vec<f64>> = (0..12).map(|_| sample(&mut rng, x, y, eye, rv)).collect();
+            m.add(&feats, [x, y], g as i64, 1.0);
+        }
+        let mut t = GazeModel::landmarks();
+        (t.f, t.y, t.g, t.w) = (m.f.clone(), m.y.clone(), m.g.clone(), m.w.clone());
+        t.geo = Some(truth.clone());
+        let truth_cv = t.fit().unwrap();
+        let (err, what) = m.fit_geometry(&mons).unwrap();
+        let found_cv = m.fit().unwrap();
+        println!("cv with the true geometry {truth_cv:.0}px, with the fitted one {found_cv:.0}px");
+        // new head positions, never seen
+        let mut errs = Vec::new();
+        for _ in 0..200 {
+            let mi = rng.random_range(0..2);
+            let mo = mons[mi];
+            let (x, y) = (mo.left as f64 + rng.random_range(0.0..1.0) * mo.width as f64, mo.top as f64 + rng.random_range(0.0..1.0) * mo.height as f64);
+            let (eye, rv) = head(&mut rng, 120.0);
+            let (px, py) = m.predict(&sample(&mut rng, x, y, eye, rv)).unwrap();
+            errs.push((px - x).hypot(py - y));
+        }
+        errs.sort_by(f64::total_cmp);
+        let med = errs[errs.len() / 2];
+        // baseline: the same samples, regressed straight to pixels
+        let mut px = GazeModel::landmarks();
+        px.f = m.f.clone();
+        px.y = m.y.clone();
+        px.g = m.g.clone();
+        px.w = m.w.clone();
+        px.fit().unwrap();
+        let mut base = Vec::new();
+        for _ in 0..200 {
+            let mi = rng.random_range(0..2);
+            let mo = mons[mi];
+            let (x, y) = (mo.left as f64 + rng.random_range(0.0..1.0) * mo.width as f64, mo.top as f64 + rng.random_range(0.0..1.0) * mo.height as f64);
+            let (eye, rv) = head(&mut rng, 120.0);
+            let (qx, qy) = px.predict(&sample(&mut rng, x, y, eye, rv)).unwrap();
+            base.push((qx - x).hypot(qy - y));
+        }
+        base.sort_by(f64::total_cmp);
+        println!("geometry: {what}, cv {err:.0}px, new head positions: median {med:.0}px (pixel regression: {:.0}px)", base[base.len() / 2]);
+        assert!(med < 80.0, "median error at new head positions {med:.0}px ({what})");
     }
 
     #[test]

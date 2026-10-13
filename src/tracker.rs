@@ -1,11 +1,12 @@
 //! Camera thread: face mesh -> gaze feature vector, hand landmarks -> pose + swipes, plus mouse-click polling
 //! (clicks are the implicit calibration signal).
 
-use crate::gaze::NF;
-use crate::gestures::{classify, Pose, Swipe, SwipeDetector};
+use crate::gaze::{LAND, NF};
+use crate::gestures::{classify, openness, HeadShake, Pose, Swipe, SwipeDetector};
+use crate::halo::LeftHand;
 use crate::now;
 use crate::vision::{FaceMesh, HandTracker, IrisModel, Rgb};
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,7 +16,10 @@ use std::sync::Arc;
 pub struct Frame {
     pub t: f64,
     pub features: Option<[f64; NF]>,
+    /// Right hand: gestures (voice typing, send, accept, swipes).
     pub pose: Option<Pose>,
+    /// Left hand: halo size and freeze.
+    pub left: Option<LeftHand>,
     /// Raw face landmarks (478 x [x, y, z], iris centres refined) + [w, h]: saved with calibrations for offline tuning.
     pub raw: Option<Arc<Vec<f32>>>,
     /// JPEG of the face box, only while recording (calibration): lets other gaze models be evaluated offline.
@@ -31,6 +35,16 @@ pub struct UgSample {
     pub land: Option<[f64; NF]>,
 }
 
+/// Small webcam image for the calibration's self view (not mirrored), with the 478 face mesh points (iris included)
+/// in image fractions (0..1).
+pub struct Preview {
+    pub w: usize,
+    pub h: usize,
+    pub rgb: Vec<u8>,
+    pub face: Option<Vec<[f32; 2]>>,
+    pub seq: u64,
+}
+
 #[derive(Default)]
 pub struct Shared {
     pub latest: Option<Frame>,
@@ -38,12 +52,18 @@ pub struct Shared {
     pub ug: VecDeque<UgSample>,
     pub ug_enabled: bool,
     pub fps: f32,
+    /// Self view, produced while recording (calibration).
+    pub preview: Option<Arc<Preview>>,
+    /// Frames per second the hands thread keeps up with.
+    pub hand_fps: f32,
     pub error: Option<String>,
 }
 
 pub struct Tracker {
     pub shared: Arc<Mutex<Shared>>,
     pub swipes: Receiver<(f64, Swipe)>,
+    /// Times of head shakes ("no").
+    pub shakes: Receiver<f64>,
     /// (t, x, y) of left-button presses, global logical coordinates.
     pub clicks: Receiver<(f64, f64, f64)>,
     pub use_hands: Arc<AtomicBool>,
@@ -79,8 +99,14 @@ fn head_angles_3d(p: &[[f32; 3]]) -> (f32, f32) {
     (y[2].clamp(-1.0, 1.0).asin(), x[2].clamp(-1.0, 1.0).asin()) // (pitch, yaw)
 }
 
-/// 14 features: iris offsets + eyelid openness for both eyes, head pose (3D axes + 2D geometry), face position/scale.
+/// 20 landmark features (then the eye patches, see `with_eye_patches`): iris offsets + eyelid openness for both eyes, head pose (3D axes + 2D geometry), face position/scale;
+/// then the metric head pose from PnP for the geometric gaze model (`geo`): head rotation vector, eye position (mm).
 pub fn features(p: &[[f32; 3]], w: usize, h: usize) -> [f64; NF] {
+    features_at(p, w, h, crate::unigaze::focal())
+}
+
+/// Same, with a given camera focal length (px at 1280 px width): recomputing samples after a calibration estimated it.
+pub fn features_at(p: &[[f32; 3]], w: usize, h: usize, focal: f64) -> [f64; NF] {
     let [rx, ry, ro] = eye_features(p, EYES[0]);
     let [lx, ly, lo] = eye_features(p, EYES[1]);
     let (e1, e2) = (p[33], p[263]);
@@ -95,18 +121,33 @@ pub fn features(p: &[[f32; 3]], w: usize, h: usize) -> [f64; NF] {
     let (pitch3, yaw3) = head_angles_3d(p);
     let cx = (p[234][0] + p[454][0]) / 2.0 / w as f32 - 0.5;
     let cy = (p[10][1] + p[152][1]) / 2.0 / h as f32 - 0.5;
-    [
+    let (hr, eye) = crate::unigaze::head_and_eyes(w, h, p, focal);
+    let rv = hr.scaled_axis();
+    let land = [
         rx, ry, ro, lx, ly, lo,
         pitch3 as f64, yaw3 as f64, roll as f64,
         cx as f64, cy as f64, (face_w / w as f32) as f64,
         yaw as f64, pitch as f64,
-    ]
+        rv.x, rv.y, rv.z, eye.x, eye.y, eye.z,
+    ];
+    let mut f = [0.0; NF];
+    f[..LAND].copy_from_slice(&land);
+    f // eye patches (LAND..NF) need the image: `with_eye_patches`
+}
+
+/// Fill the eye patch features (see `vision::eye_patches`).
+pub fn with_eye_patches(mut f: [f64; NF], img: &Rgb, mesh: &[[f32; 3]]) -> [f64; NF] {
+    for (k, v) in crate::vision::eye_patches(img, mesh).into_iter().enumerate() {
+        f[LAND + k] = v as f64;
+    }
+    f
 }
 
 impl Tracker {
     pub fn start(camera: u32, models: std::path::PathBuf) -> Tracker {
         let shared = Arc::new(Mutex::new(Shared::default()));
         let (swipe_tx, swipes) = unbounded();
+        let (shake_tx, shakes) = unbounded();
         let (click_tx, clicks) = unbounded();
         let use_hands = Arc::new(AtomicBool::new(true));
         let mirrored = Arc::new(AtomicBool::new(false));
@@ -114,6 +155,7 @@ impl Tracker {
         let t = Tracker {
             shared: shared.clone(),
             swipes,
+            shakes,
             clicks,
             use_hands: use_hands.clone(),
             mirrored: mirrored.clone(),
@@ -122,7 +164,7 @@ impl Tracker {
         std::thread::Builder::new()
             .name("tracker".into())
             .spawn(move || {
-                if let Err(e) = run(camera, &models, &shared, swipe_tx, use_hands, mirrored, record) {
+                if let Err(e) = run(camera, &models, &shared, swipe_tx, shake_tx, use_hands, mirrored, record) {
                     shared.lock().error = Some(format!("{e:#}"));
                 }
             })
@@ -133,6 +175,11 @@ impl Tracker {
 
     pub fn latest(&self) -> Option<Frame> {
         self.shared.lock().latest.clone()
+    }
+
+    /// (time, features, raw landmarks) of the frames with a face in (t0, t1].
+    pub fn samples_between(&self, t0: f64, t1: f64) -> Vec<(f64, [f64; NF], Option<Arc<Vec<f32>>>)> {
+        self.shared.lock().history.iter().filter(|f| f.t > t0 && f.t <= t1).filter_map(|f| Some((f.t, f.features?, f.raw.clone()))).collect()
     }
 
     pub fn raw_between(&self, t0: f64, t1: f64) -> Vec<(Arc<Vec<f32>>, Option<Arc<Vec<u8>>>)> {
@@ -170,6 +217,7 @@ fn run(
     models: &std::path::Path,
     shared_arc: &Arc<Mutex<Shared>>,
     swipe_tx: Sender<(f64, Swipe)>,
+    shake_tx: Sender<f64>,
     use_hands: Arc<AtomicBool>,
     mirrored: Arc<AtomicBool>,
     record: Arc<AtomicBool>,
@@ -207,25 +255,46 @@ fn run(
         eprintln!("UniGaze model not found ({}): run scripts/fetch_unigaze.sh for better accuracy", ug_path.display());
     }
     let mut iris = IrisModel::new(models).map_err(|e| eprintln!("iris model unavailable ({e:#}): using face-mesh iris")).ok();
-    let mut hands: Option<HandTracker> = None;
     let cam = Cam::open(camera).map_err(|e| {
         anyhow::anyhow!("{e:#}. Grant Camera access to your terminal app (macOS: System Settings > Privacy & Security > Camera)")
     })?;
-    let mut swipe = SwipeDetector::new();
-    let (mut n, mut t_fps, mut frames) = (0u64, now(), 0u32);
-    let mut pose = None;
+    // hands run in parallel with the face, on every frame they can keep up with (latest frame only)
+    let hand_state = Arc::new(Mutex::new(HandState::default()));
+    let (job_tx, job_rx) = bounded::<HandJob>(1);
+    // face centre x (image px, f32 bits; NaN: no face): the hands thread tells left from right with it
+    let face_x = Arc::new(std::sync::atomic::AtomicU32::new(f32::NAN.to_bits()));
+    {
+        let (models, state, shared, face_x) = (models.to_path_buf(), hand_state.clone(), shared_arc.clone(), face_x.clone());
+        std::thread::Builder::new().name("hands".into()).spawn(move || {
+            if let Err(e) = run_hands(&models, job_rx, &state, &shared, swipe_tx, mirrored, &face_x) {
+                shared.lock().error = Some(format!("{e:#}"));
+            }
+        })?;
+    }
+    let mut shake = HeadShake::new();
+    let (mut t_fps, mut frames) = (now(), 0u32);
     loop {
         let img = cam.frame()?;
         let t = now();
         let (w, h) = (img.width, img.height);
-        let rgb = Rgb { w, h, data: &img.data };
+        let data = Arc::new(img.data);
+        let hands_on = use_hands.load(Ordering::Relaxed);
+        if hands_on {
+            let _ = job_tx.try_send((t, w, h, data.clone())); // busy: it gets a later frame
+        }
+        let rgb = Rgb { w, h, data: &data };
         let mut mesh = face.process(&rgb)?;
         if let (Some(p), Some(iris)) = (mesh.as_mut(), iris.as_mut()) {
             let [r, l] = iris.process(&rgb, p)?;
             p[468][..2].copy_from_slice(&r);
             p[473][..2].copy_from_slice(&l);
         }
-        let feats = mesh.as_ref().map(|p| features(p, w, h));
+        let feats = mesh.as_ref().map(|p| with_eye_patches(features(p, w, h), &rgb, p));
+        let fx = mesh.as_ref().map_or(f32::NAN, |p| (p[234][0] + p[454][0]) / 2.0);
+        face_x.store(fx.to_bits(), Ordering::Relaxed);
+        if shake.update(t, feats.map(|f| f[12] as f32)) {
+            let _ = shake_tx.send(t); // 2D yaw: nose offset / face width
+        }
         if let Some(p) = mesh.as_ref() {
             if ug_tx.is_empty() {
                 if let Some(chw) = crate::unigaze::normalize(&rgb, p) {
@@ -233,8 +302,23 @@ fn run(
                 }
             }
         }
+        if record.load(Ordering::Relaxed) && frames % 2 == 0 {
+            // self view for the calibration: 1/4 size (nearest pixel: cheap), every other frame
+            let (pw, ph) = (w / 4, h / 4);
+            let mut rgb = Vec::with_capacity(pw * ph * 3);
+            for y in 0..ph {
+                let row = y * 4 * w;
+                for x in 0..pw {
+                    let i = (row + x * 4) * 3;
+                    rgb.extend_from_slice(&data[i..i + 3]);
+                }
+            }
+            let face = mesh.as_ref().map(|p| p.iter().map(|q| [q[0] / w as f32, q[1] / h as f32]).collect());
+            let seq = shared.lock().preview.as_ref().map_or(0, |p| p.seq + 1);
+            shared.lock().preview = Some(Arc::new(Preview { w: pw, h: ph, rgb, face, seq }));
+        }
         let crop = match (&mesh, record.load(Ordering::Relaxed)) {
-            (Some(p), true) => face_jpeg(&img.data, w, h, p).map(Arc::new),
+            (Some(p), true) => face_jpeg(&data, w, h, p).map(Arc::new),
             _ => None,
         };
         let raw = mesh.map(|p| {
@@ -243,25 +327,13 @@ fn run(
             Arc::new(v)
         });
 
-        if use_hands.load(Ordering::Relaxed) {
-            if hands.is_none() {
-                hands = Some(HandTracker::new(models)?);
-            }
-            if n % 2 == 0 {
-                // hands every other frame: saves CPU
-                let lm = hands.as_mut().unwrap().process(&rgb)?;
-                let pts: Option<Vec<[f32; 2]>> = lm.map(|p| p.iter().map(|q| [q[0] / h as f32, q[1] / h as f32]).collect());
-                pose = pts.as_ref().map(|p| classify(p));
-                swipe.mirrored = mirrored.load(Ordering::Relaxed);
-                if let Some(dir) = swipe.update(t, pts.as_ref().map(|p| p[0])) {
-                    let _ = swipe_tx.send((t, dir));
-                }
-            }
+        let (pose, left) = if hands_on {
+            let hs = hand_state.lock();
+            (hs.pose, hs.left)
         } else {
-            pose = None;
-        }
-
-        let f = Frame { t, features: feats, pose, raw, crop };
+            (None, None)
+        };
+        let f = Frame { t, features: feats, pose, left, raw, crop };
         {
             let mut s = shared.lock();
             s.history.push_back(f.clone());
@@ -270,7 +342,6 @@ fn run(
             }
             s.latest = Some(f);
         }
-        n += 1;
         frames += 1;
         if t - t_fps >= 1.0 {
             shared.lock().fps = frames as f32 / (t - t_fps) as f32;
@@ -278,6 +349,80 @@ fn run(
             t_fps = t;
         }
     }
+}
+
+/// Latest hand results, written by the hands thread.
+#[derive(Default)]
+struct HandState {
+    pose: Option<Pose>,
+    left: Option<LeftHand>,
+}
+
+type HandJob = (f64, usize, usize, Arc<Vec<u8>>);
+
+/// Hands thread: right hand -> pose + swipes, left hand -> halo control.
+fn run_hands(
+    models: &std::path::Path,
+    jobs: Receiver<HandJob>,
+    state: &Mutex<HandState>,
+    shared: &Mutex<Shared>,
+    swipe_tx: Sender<(f64, Swipe)>,
+    mirrored: Arc<AtomicBool>,
+    face_x: &std::sync::atomic::AtomicU32,
+) -> anyhow::Result<()> {
+    let mut hands = HandTracker::new(models)?;
+    let mut swipe = SwipeDetector::new();
+    let (mut t_fps, mut frames) = (now(), 0u32);
+    let mut idle = false;
+    for (t, w, h, data) in jobs {
+        // no hand in view: every other frame is enough to notice one appearing (saves CPU)
+        if std::mem::replace(&mut idle, false) {
+            continue;
+        }
+        frames += 1;
+        if t - t_fps >= 1.0 {
+            shared.lock().hand_fps = frames as f32 / (t - t_fps) as f32;
+            (t_fps, frames) = (t, 0);
+        }
+        let mirror = mirrored.load(Ordering::Relaxed);
+        let mut found = hands.process(&Rgb { w, h, data: &data }, mirror)?;
+        // Which hand is which: by its side of the face (the camera image is not mirrored: the user's right hand shows
+        // on the image's left), which is what the user means by "left" and "right"; MediaPipe's handedness classifier
+        // proved unreliable here. It is kept only when both hands sit on the same side (crossed arms) or no face.
+        let fx = f32::from_bits(face_x.load(Ordering::Relaxed));
+        if fx.is_finite() {
+            let by_side: Vec<bool> = found.iter().map(|hd| (hd.pts[0][0] < fx) != mirror).collect();
+            if !(found.len() == 2 && by_side[0] == by_side[1]) {
+                for (hd, r) in found.iter_mut().zip(by_side) {
+                    hd.right = r;
+                }
+            }
+        }
+        let norm = |right: bool| -> Option<Vec<[f32; 2]>> {
+            let hand = found.iter().find(|x| x.right == right)?;
+            Some(hand.pts.iter().map(|q| [q[0] / h as f32, q[1] / h as f32]).collect())
+        };
+        let (r, l) = (norm(true), norm(false));
+        idle = found.is_empty();
+        {
+            let mut s = state.lock();
+            s.pose = r.as_ref().map(|p| classify(p));
+            s.left = l.as_ref().map(|p| LeftHand { wrist: p[0], openness: openness(p), raised: raised(p) });
+        }
+        swipe.mirrored = mirror;
+        if let Some(dir) = swipe.update(t, r.as_ref().map(|p| p[0])) {
+            let _ = swipe_tx.send((t, dir));
+        }
+    }
+    Ok(())
+}
+
+/// Hand held up in front of the camera: wrist inside the frame and fingers pointing up (wrist -> middle knuckle
+/// within 45 degrees of vertical). A hand resting on the desk or keyboard is low and seen flat or sideways.
+/// `p`: landmarks in frame-height units.
+fn raised(p: &[[f32; 2]]) -> bool {
+    let (dx, dy) = (p[9][0] - p[0][0], p[9][1] - p[0][1]);
+    p[0][1] < 0.95 && -dy > dx.abs()
 }
 
 /// JPEG (q90) of the face box, padded by 10%.
@@ -319,11 +464,25 @@ pub struct RgbFrame {
 impl Cam {
     fn open(index: u32) -> anyhow::Result<Self> {
         use nokhwa::pixel_format::RgbFormat;
-        use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
-        let fmt = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
-        let mut cam = nokhwa::Camera::new(CameraIndex::Index(index), fmt)?;
-        cam.open_stream()?;
-        Ok(Self(std::sync::Mutex::new(cam)))
+        use nokhwa::utils::{CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution};
+        // 1280x720 at 30 fps if the camera has it (MJPEG): the highest frame rate alone picks 640x480 on most
+        // webcams, where an eye is ~15 px wide and gaze moves the iris by less than a pixel.
+        let want = CameraFormat::new(Resolution::new(1280, 720), FrameFormat::MJPEG, 30);
+        let requests = [RequestedFormatType::Closest(want), RequestedFormatType::AbsoluteHighestFrameRate];
+        let mut last = None;
+        for req in requests {
+            match nokhwa::Camera::new(CameraIndex::Index(index), RequestedFormat::new::<RgbFormat>(req)).and_then(|mut cam| {
+                cam.open_stream()?;
+                Ok(cam)
+            }) {
+                Ok(cam) => {
+                    println!("camera: {}", cam.camera_format());
+                    return Ok(Self(std::sync::Mutex::new(cam)));
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.map_or_else(|| anyhow::anyhow!("no camera"), Into::into))
     }
 
     fn frame(&self) -> anyhow::Result<RgbFrame> {

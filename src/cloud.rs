@@ -55,6 +55,15 @@ impl Smudge {
         Self { tex: None, radius: 120.0, frame: 0 }
     }
 
+    pub fn radius(&self) -> f32 {
+        self.radius
+    }
+
+    /// Set the size directly (px): the halo's radius, chosen with the left hand.
+    pub fn set_radius(&mut self, r: f32) {
+        self.radius = r;
+    }
+
     /// Ease the size towards the one implied by the gaze noise (px). Size changes slowly; position never lags.
     pub fn set_noise(&mut self, jitter: f64, dt: f64) {
         let target = (1.4 * jitter as f32 + 50.0).clamp(80.0, 230.0);

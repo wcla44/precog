@@ -4,3 +4,6 @@
 __pycache__/
 models/*.task
 models/onnx/
+/result
+/precog-bundle
+/dist

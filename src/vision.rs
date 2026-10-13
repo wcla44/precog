@@ -78,6 +78,13 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x.clamp(-100.0, 100.0)).exp())
 }
 
+/// Intersection over union of two axis-aligned boxes given as (centre, size).
+fn iou(c1: (f32, f32), s1: (f32, f32), c2: (f32, f32), s2: (f32, f32)) -> f32 {
+    let overlap = |c1: f32, s1: f32, c2: f32, s2: f32| ((c1 + s1 / 2.0).min(c2 + s2 / 2.0) - (c1 - s1 / 2.0).max(c2 - s2 / 2.0)).max(0.0);
+    let inter = overlap(c1.0, s1.0, c2.0, s2.0) * overlap(c1.1, s1.1, c2.1, s2.1);
+    inter / (s1.0 * s1.1 + s2.0 * s2.1 - inter).max(1e-6)
+}
+
 fn norm_angle(a: f32) -> f32 {
     a - 2.0 * PI * ((a + PI) / (2.0 * PI)).floor()
 }
@@ -105,8 +112,20 @@ impl Detector {
         self.detect_in(img, -(s - img.w as f32) / 2.0, -(s - img.h as f32) / 2.0, s)
     }
 
+    /// Up to `max` detections in the whole frame, best first (hands: both of them).
+    fn detect_all(&mut self, img: &Rgb, max: usize) -> Result<Vec<Detection>> {
+        let s = img.w.max(img.h) as f32;
+        self.detect_in_all(img, -(s - img.w as f32) / 2.0, -(s - img.h as f32) / 2.0, s, max)
+    }
+
     /// Detect inside the square [x0, x0+side] x [y0, y0+side] (image pixels, may extend past the borders).
     fn detect_in(&mut self, img: &Rgb, x0: f32, y0: f32, side: f32) -> Result<Option<Detection>> {
+        Ok(self.detect_in_all(img, x0, y0, side, 1)?.into_iter().next())
+    }
+
+    /// Up to `max` detections in that square, best first, with non-maximum suppression (overlapping boxes keep the
+    /// best one).
+    fn detect_in_all(&mut self, img: &Rgb, x0: f32, y0: f32, side: f32, max: usize) -> Result<Vec<Detection>> {
         // half-pixel centres like cv2.resize
         let k = side / self.size as f32;
         let m = Affine([k, 0.0, 0.5 * k - 0.5 + x0, 0.0, k, 0.5 * k - 0.5 + y0]);
@@ -116,25 +135,30 @@ impl Detector {
         let outputs = self.session.run(ort::inputs![self.input.as_str() => tensor])?;
         let (_, reg) = outputs[0].try_extract_tensor::<f32>()?;
         let (_, cls) = outputs[1].try_extract_tensor::<f32>()?;
-        let (best, &raw) = cls
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .context("empty detector output")?;
-        let score = sigmoid(raw);
-        if score < 0.5 {
-            return Ok(None);
-        }
+        anyhow::ensure!(!cls.is_empty(), "empty detector output");
+        let mut order: Vec<usize> = (0..cls.len()).filter(|&i| sigmoid(cls[i]) >= 0.5).collect();
+        order.sort_by(|&a, &b| cls[b].total_cmp(&cls[a]));
         let stride = reg.len() / cls.len();
-        let r = &reg[best * stride..(best + 1) * stride];
         let sz = self.size as f32;
-        let a = self.anchors[best];
         let to_img = |px: f32, py: f32| (px * side + x0, py * side + y0);
-        let center = to_img(r[0] / sz + a.0, r[1] / sz + a.1);
-        let keypoints = (0..self.keypoints)
-            .map(|i| to_img(r[4 + 2 * i] / sz + a.0, r[5 + 2 * i] / sz + a.1))
-            .collect();
-        Ok(Some(Detection { score, center, size: (r[2] / sz * side, r[3] / sz * side), keypoints }))
+        let mut out: Vec<Detection> = Vec::new();
+        for best in order {
+            let r = &reg[best * stride..(best + 1) * stride];
+            let a = self.anchors[best];
+            let center = to_img(r[0] / sz + a.0, r[1] / sz + a.1);
+            let size = (r[2] / sz * side, r[3] / sz * side);
+            if out.iter().any(|d| iou(d.center, d.size, center, size) > 0.3) {
+                continue;
+            }
+            let keypoints = (0..self.keypoints)
+                .map(|i| to_img(r[4 + 2 * i] / sz + a.0, r[5 + 2 * i] / sz + a.1))
+                .collect();
+            out.push(Detection { score: sigmoid(cls[best]), center, size, keypoints });
+            if out.len() >= max {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Whole frame first; if nothing, zoom on central squares. The short-range face model needs the face to be
@@ -165,6 +189,10 @@ pub struct Roi {
 }
 
 impl Roi {
+    fn overlaps(&self, o: &Roi) -> bool {
+        (self.cx - o.cx).hypot(self.cy - o.cy) < 0.5 * self.side.max(o.side)
+    }
+
     /// Affine from an `out`x`out` crop to the image.
     fn affine(&self, out: usize) -> Affine {
         let (c, s) = (self.angle.cos(), self.angle.sin());
@@ -181,6 +209,8 @@ pub fn session_with_threads(path: &Path, threads: usize) -> Result<Session> {
         .with_auto_device(ort::session::builder::AutoDevicePolicy::PreferCPU)
         .and_then(|b| b.with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3))
         .and_then(|b| b.with_intra_threads(threads))
+        // worker threads sleep between runs instead of busy-waiting (spinning kept ~2 cores busy on a laptop)
+        .and_then(|b| b.with_intra_op_spinning(false))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(b.commit_from_file(path)?)
 }
@@ -199,13 +229,16 @@ fn env() -> Result<&'static ort::environment::Environment> {
 fn session(dir: &Path, name: &str) -> Result<Session> {
     let env = env()?;
     let path = dir.join(name);
-    let threads = std::env::var("PRECOG_ORT_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    // 4 threads measured fastest on Apple silicon; elsewhere 2 leave room for the other models and the desktop
+    let threads = std::env::var("PRECOG_ORT_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(if cfg!(target_os = "macos") { 4 } else { 2 });
     // ort defaults to an "efficiency" device policy, which on Apple silicon is ~9x slower for these small
     // models (21 ms vs 2.4 ms for the face mesh): force the plain CPU path.
     let b = Session::builder(env)?
         .with_auto_device(ort::session::builder::AutoDevicePolicy::PreferCPU)
         .and_then(|b| b.with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3))
         .and_then(|b| b.with_intra_threads(threads))
+        // worker threads sleep between runs instead of busy-waiting (spinning kept ~2 cores busy on a laptop)
+        .and_then(|b| b.with_intra_op_spinning(false))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut b = b;
     b.commit_from_file(&path).with_context(|| format!("loading {} (run scripts/convert_models.sh)", path.display()))
@@ -293,15 +326,24 @@ fn roi_from_points(pts: &[[f32; 3]], a: [f32; 3], b: [f32; 3], target: f32, scal
     Roi { cx: rcx * c - rcy * s, cy: rcx * s + rcy * c, side: w.max(h) * scale, angle }
 }
 
-/// 21 hand landmarks in image pixels.
+/// One tracked hand: 21 landmarks in image pixels, and which of the user's hands it is.
+pub struct Hand {
+    pub pts: Vec<[f32; 3]>,
+    pub right: bool,
+}
+
+/// Up to two hands, each tracked frame to frame like MediaPipe's hand landmarker.
 pub struct HandTracker {
     detector: Detector,
     landmarks: Session,
     input: String,
-    roi: Option<Roi>,
+    rois: Vec<Roi>,
+    calls: u64,
 }
 
 impl HandTracker {
+    const MAX_HANDS: usize = 2;
+
     pub fn new(dir: &Path) -> Result<Self> {
         let det = session(dir, "hand_detector.onnx")?;
         let lm = session(dir, "hand_landmarks_detector.onnx")?;
@@ -316,28 +358,41 @@ impl HandTracker {
             },
             input: input_name(&lm),
             landmarks: lm,
-            roi: None,
+            rois: Vec::new(),
+            calls: 0,
         })
     }
 
-    pub fn process(&mut self, img: &Rgb) -> Result<Option<Vec<[f32; 3]>>> {
-        let roi = match self.roi {
-            Some(r) => r,
-            None => {
-                let Some(d) = self.detector.detect(img)? else { return Ok(None) };
-                // wrist (kp0) -> middle finger MCP (kp2), target 90 degrees
-                let (w, m) = (d.keypoints[0], d.keypoints[2]);
-                let angle = norm_angle(PI / 2.0 - (-(m.1 - w.1)).atan2(m.0 - w.0));
-                let side = d.size.0.max(d.size.1);
-                let (sx, sy) = (0.0, -0.5 * side); // shift towards the fingers
-                Roi {
-                    cx: d.center.0 + sx * angle.cos() - sy * angle.sin(),
-                    cy: d.center.1 + sx * angle.sin() + sy * angle.cos(),
-                    side: side * 2.6,
-                    angle,
+    /// `mirrored`: the camera image is mirrored like a selfie view (MediaPipe's handedness assumes it is).
+    pub fn process(&mut self, img: &Rgb, mirrored: bool) -> Result<Vec<Hand>> {
+        // look for new hands while fewer than two are tracked; with one already tracked, every 3rd call only (CPU)
+        if self.rois.len() < Self::MAX_HANDS && (self.rois.is_empty() || self.calls % 3 == 0) {
+            for d in self.detector.detect_all(img, Self::MAX_HANDS)? {
+                let roi = palm_roi(&d);
+                if self.rois.len() < Self::MAX_HANDS && !self.rois.iter().any(|r| r.overlaps(&roi)) {
+                    self.rois.push(roi);
                 }
             }
-        };
+        }
+        self.calls += 1;
+        let mut hands = Vec::new();
+        let mut next: Vec<Roi> = Vec::new();
+        for roi in std::mem::take(&mut self.rois) {
+            let Some((pts, right_score)) = self.landmarks_in(img, roi)? else { continue };
+            // track: wrist -> middle MCP, like MediaPipe's hand landmarks -> ROI
+            let tracked = roi_from_points(&pts, pts[0], pts[9], PI / 2.0, 2.0, -0.1);
+            if next.iter().any(|r| r.overlaps(&tracked)) {
+                continue; // two ROIs converged on the same hand
+            }
+            next.push(tracked);
+            hands.push(Hand { pts, right: (right_score > 0.5) == mirrored });
+        }
+        self.rois = next;
+        Ok(hands)
+    }
+
+    /// Landmarks and right-hand score inside one ROI, or None if there is no hand there.
+    fn landmarks_in(&mut self, img: &Rgb, roi: Roi) -> Result<Option<(Vec<[f32; 3]>, f32)>> {
         let m = roi.affine(224);
         let data = warp(img, m, 224, |p| p / 255.0);
         let tensor = Tensor::from_array(([1usize, 224, 224, 3], data))?;
@@ -345,9 +400,9 @@ impl HandTracker {
         let (_, raw) = outputs[0].try_extract_tensor::<f32>()?;
         let (_, presence) = outputs[1].try_extract_tensor::<f32>()?;
         if presence[0] < 0.8 { // real hands score >0.99; the palm detector sometimes fires on faces (~0.5)
-            self.roi = None;
             return Ok(None);
         }
+        let (_, handedness) = outputs[2].try_extract_tensor::<f32>()?;
         let pts: Vec<[f32; 3]> = raw
             .chunks_exact(3)
             .map(|p| {
@@ -355,9 +410,21 @@ impl HandTracker {
                 [x, y, p[2]]
             })
             .collect();
-        // track: wrist -> middle MCP, like MediaPipe's hand landmarks -> ROI
-        self.roi = Some(roi_from_points(&pts, pts[0], pts[9], PI / 2.0, 2.0, -0.1));
-        Ok(Some(pts))
+        Ok(Some((pts, handedness[0])))
+    }
+}
+
+/// Palm detection -> hand ROI: wrist (kp0) -> middle finger MCP (kp2) points up, shifted towards the fingers.
+fn palm_roi(d: &Detection) -> Roi {
+    let (w, m) = (d.keypoints[0], d.keypoints[2]);
+    let angle = norm_angle(PI / 2.0 - (-(m.1 - w.1)).atan2(m.0 - w.0));
+    let side = d.size.0.max(d.size.1);
+    let (sx, sy) = (0.0, -0.5 * side);
+    Roi {
+        cx: d.center.0 + sx * angle.cos() - sy * angle.sin(),
+        cy: d.center.1 + sx * angle.sin() + sy * angle.cos(),
+        side: side * 2.6,
+        angle,
     }
 }
 
@@ -419,4 +486,55 @@ pub fn face_box(mesh: &[[f32; 3]]) -> (f32, f32, f32, f32) {
         y1 = y1.max(p[1]);
     }
     (x0, y0, x1 - x0, y1 - y0)
+}
+
+/// Eye patches, as in WebGazer: for each eye, the area around it (1.5 x 0.9 eye widths, aligned with the eye corners,
+/// so it holds the eyelids too), grey, 10x6 (sampled 20x12 and averaged 2x2), contrast-normalised (zero mean, unit
+/// variance: robust to lighting). Subject's right eye then left eye: 2 x 60 values. Their appearance carries the
+/// vertical gaze (eyelid shape, how much of the iris shows) much better than the iris landmarks.
+pub const EYE_PATCH: usize = 60;
+
+pub fn eye_patches(img: &Rgb, mesh: &[[f32; 3]]) -> [f32; 2 * EYE_PATCH] {
+    let grey = |x: f32, y: f32| -> f32 {
+        let (x0, y0) = (x.floor().clamp(0.0, img.w as f32 - 2.0), y.floor().clamp(0.0, img.h as f32 - 2.0));
+        let (fx, fy) = ((x - x0).clamp(0.0, 1.0), (y - y0).clamp(0.0, 1.0));
+        let px = |xx: usize, yy: usize| {
+            let i = (yy * img.w + xx) * 3;
+            0.299 * img.data[i] as f32 + 0.587 * img.data[i + 1] as f32 + 0.114 * img.data[i + 2] as f32
+        };
+        let (xi, yi) = (x0 as usize, y0 as usize);
+        let top = px(xi, yi) * (1.0 - fx) + px(xi + 1, yi) * fx;
+        let bot = px(xi, yi + 1) * (1.0 - fx) + px(xi + 1, yi + 1) * fx;
+        top * (1.0 - fy) + bot * fy
+    };
+    let mut out = [0f32; 2 * EYE_PATCH];
+    for (e, (c1, c2)) in [(33usize, 133usize), (362, 263)].into_iter().enumerate() {
+        let (a, b) = (mesh[c1], mesh[c2]);
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let ew = dx.hypot(dy).max(1.0);
+        let (ux, uy) = (dx / ew, dy / ew); // along the eye, image left to right
+        let (vx, vy) = (-uy, ux); // down
+        let (cx, cy) = ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0);
+        let (w, h) = (1.5 * ew, 0.9 * ew);
+        let mut fine = [0f32; 20 * 12];
+        for j in 0..12 {
+            for i in 0..20 {
+                let (s, t) = (((i as f32 + 0.5) / 20.0 - 0.5) * w, ((j as f32 + 0.5) / 12.0 - 0.5) * h);
+                fine[j * 20 + i] = grey(cx + ux * s + vx * t, cy + uy * s + vy * t);
+            }
+        }
+        let patch = &mut out[e * EYE_PATCH..(e + 1) * EYE_PATCH];
+        for j in 0..6 {
+            for i in 0..10 {
+                let f = |ii: usize, jj: usize| fine[(2 * j + jj) * 20 + 2 * i + ii];
+                patch[j * 10 + i] = (f(0, 0) + f(1, 0) + f(0, 1) + f(1, 1)) / 4.0;
+            }
+        }
+        let mean = patch.iter().sum::<f32>() / EYE_PATCH as f32;
+        let sd = (patch.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / EYE_PATCH as f32).sqrt().max(1.0);
+        for v in patch.iter_mut() {
+            *v = (*v - mean) / sd;
+        }
+    }
+    out
 }

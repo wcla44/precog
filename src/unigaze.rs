@@ -30,9 +30,27 @@ pub const SIZE: usize = 224;
 const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const STD: [f32; 3] = [0.229, 0.224, 0.225];
 
-/// Approximate webcam intrinsics: focal ~1000 px at 1280 px width (MacBook-class FOV), principal point at the centre.
-fn camera(w: usize, h: usize) -> Matrix3<f64> {
-    let f = 1000.0 * w as f64 / 1280.0;
+/// Camera focal length in px at 1280 px width (f64 bits). Default ~1000 (MacBook-class FOV); a calibration estimates
+/// the real one (wide-angle webcams are around 600-700) and sets it, see `set_focal`.
+static FOCAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x408F_4000_0000_0000); // 1000.0
+
+pub fn focal() -> f64 {
+    f64::from_bits(FOCAL.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+pub fn set_focal(f: f64) {
+    if f.is_finite() && (200.0..4000.0).contains(&f) {
+        FOCAL.store(f.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Approximate webcam intrinsics: the focal above, principal point at the centre.
+pub fn camera(w: usize, h: usize) -> Matrix3<f64> {
+    camera_with(w, h, focal())
+}
+
+pub fn camera_with(w: usize, h: usize, focal_1280: f64) -> Matrix3<f64> {
+    let f = focal_1280 * w as f64 / 1280.0;
     Matrix3::new(f, 0.0, w as f64 / 2.0, 0.0, f, h as f64 / 2.0, 0.0, 0.0, 1.0)
 }
 
@@ -86,6 +104,17 @@ pub fn solve_pnp(k: &Matrix3<f64>, img_pts: &[Vector2<f64>; 6]) -> (Rotation3<f6
         }
     }
     (Rotation3::new(Vector3::new(x[0], x[1], x[2])), Vector3::new(x[3], x[4], x[5]))
+}
+
+/// Head pose and eye position in the camera frame (mm; x right, y down, z from the camera towards the user, as
+/// seen in the image): head rotation, and the midpoint of the two eyeball centres (~10 mm behind the eye corners).
+pub fn head_and_eyes(w: usize, h: usize, mesh: &[[f32; 3]], focal_1280: f64) -> (Rotation3<f64>, Vector3<f64>) {
+    let k = camera_with(w, h, focal_1280);
+    let pts: [Vector2<f64>; 6] = MP.map(|i| Vector2::new(mesh[i][0] as f64, mesh[i][1] as f64));
+    let (hr, t) = solve_pnp(&k, &pts);
+    let corner = |i: usize| Vector3::new(FACE[i][0], FACE[i][1], FACE[i][2]);
+    let eyes = (corner(0) + corner(1) + corner(2) + corner(3)) / 4.0 + Vector3::new(0.0, 0.0, 10.0);
+    (hr, hr * eyes + t)
 }
 
 /// Normalised face (CHW, ImageNet-normalised RGB, 224x224) from a frame and its face mesh.

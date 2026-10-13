@@ -13,11 +13,12 @@ pub enum Pose {
 impl Pose {
     pub fn icon(p: Option<Pose>) -> &'static str {
         match p {
-            Some(Pose::Open) => "✋",
-            Some(Pose::Fist) => "✊",
-            Some(Pose::Pinch) => "🤏",
-            Some(Pose::Other) => "🖐",
-            None => "·",
+            // words: egui's bundled fonts lack most hand emoji (they showed as empty boxes)
+            Some(Pose::Open) => "open",
+            Some(Pose::Fist) => "fist",
+            Some(Pose::Pinch) => "pinch",
+            Some(Pose::Other) => "hand",
+            None => "-",
         }
     }
 }
@@ -54,6 +55,13 @@ pub fn classify(lm: &[[f32; 2]]) -> Pose {
     } else {
         Pose::Other
     }
+}
+
+/// How open the hand is: 0 = fist, 1 = fully open. Finger tips' distance to the wrist relative to their knuckles'
+/// (about 1 when curled, about 1.8 when extended), so it doesn't depend on hand size or distance to the camera.
+pub fn openness(lm: &[[f32; 2]]) -> f32 {
+    let r = FINGERS.iter().map(|&(mcp, _, tip)| dist(lm[tip], lm[WRIST]) / dist(lm[mcp], lm[WRIST]).max(1e-6)).sum::<f32>() / 4.0;
+    ((r - 1.0) / 0.75).clamp(0.0, 1.0)
 }
 
 /// Swipes in the USER's frame of reference: Left = the user moves the hand to their left.
@@ -96,6 +104,62 @@ impl SwipeDetector {
             return Some(if dx > 0.0 { Swipe::Left } else { Swipe::Right });
         }
         None
+    }
+}
+
+/// Head shake ("no"): the head turns left-right-left (or right-left-right) within about a second. Turning towards
+/// another screen is a single movement, so it doesn't count.
+pub struct HeadShake {
+    trail: VecDeque<(f64, f32)>,
+    last: f64,
+}
+
+impl HeadShake {
+    const WINDOW: f64 = 1.2;
+    /// Yaw change that counts as one swing (yaw feature: nose offset / face width, about 0.3 at 45 degrees).
+    const SWING: f32 = 0.07;
+    const SWINGS: usize = 3;
+    const COOLDOWN: f64 = 1.5;
+
+    pub fn new() -> Self {
+        Self { trail: VecDeque::new(), last: -1e9 }
+    }
+
+    /// `yaw`: None when the face is lost. Returns true once per shake.
+    pub fn update(&mut self, t: f64, yaw: Option<f32>) -> bool {
+        let Some(y) = yaw else {
+            self.trail.clear();
+            return false;
+        };
+        self.trail.push_back((t, y));
+        while self.trail.front().is_some_and(|p| t - p.0 > Self::WINDOW) {
+            self.trail.pop_front();
+        }
+        if t - self.last < Self::COOLDOWN {
+            return false;
+        }
+        // zig-zag: a swing ends when the yaw comes back by SWING from its extreme
+        let start = self.trail.front().map_or(y, |p| p.1);
+        let (mut dir, mut extreme, mut swings) = (0i8, start, 0);
+        for &(_, v) in &self.trail {
+            match dir {
+                0 if (v - start).abs() >= Self::SWING => (dir, extreme) = (if v > start { 1 } else { -1 }, v),
+                1 if v > extreme => extreme = v,
+                -1 if v < extreme => extreme = v,
+                1 | -1 if (extreme - v).abs() >= Self::SWING => {
+                    swings += 1;
+                    (dir, extreme) = (-dir, v);
+                }
+                _ => {}
+            }
+        }
+        // completed swings plus the one in progress
+        if swings + (dir != 0) as usize >= Self::SWINGS {
+            self.last = t;
+            self.trail.clear();
+            return true;
+        }
+        false
     }
 }
 
@@ -148,6 +212,20 @@ mod tests {
         assert_eq!(classify(&hand([true; 4], false)), Pose::Open);
         assert_eq!(classify(&hand([false; 4], false)), Pose::Fist);
         assert_eq!(classify(&hand([true; 4], true)), Pose::Pinch);
+        assert!(openness(&hand([false; 4], false)) < 0.1);
+        assert!(openness(&hand([true; 4], false)) > 0.4);
+    }
+
+    #[test]
+    fn head_shake() {
+        let mut s = HeadShake::new();
+        // left-right-left in 0.9 s
+        let shook = (0..28).any(|i| s.update(i as f64 / 30.0, Some(0.12 * (i as f32 / 30.0 * 2.0 * std::f32::consts::PI * 1.7).sin())));
+        assert!(shook);
+        // turning the head once towards another screen and staying there
+        let mut s = HeadShake::new();
+        let turned = (0..60).any(|i| s.update(i as f64 / 30.0, Some((i as f32 / 20.0).min(1.0) * 0.25)));
+        assert!(!turned);
     }
 
     #[test]
