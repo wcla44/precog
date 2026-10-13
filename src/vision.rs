@@ -174,15 +174,30 @@ impl Roi {
     }
 }
 
-fn session(dir: &Path, name: &str) -> Result<Session> {
+/// Session for any model file, plain CPU (see `session`), with its own thread count.
+pub fn session_with_threads(path: &Path, threads: usize) -> Result<Session> {
+    let env = env()?;
+    let mut b = Session::builder(env)?
+        .with_auto_device(ort::session::builder::AutoDevicePolicy::PreferCPU)
+        .and_then(|b| b.with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3))
+        .and_then(|b| b.with_intra_threads(threads))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(b.commit_from_file(path)?)
+}
+
+fn env() -> Result<&'static ort::environment::Environment> {
     static ENV: std::sync::OnceLock<ort::environment::Environment> = std::sync::OnceLock::new();
-    let env = match ENV.get() {
+    Ok(match ENV.get() {
         Some(e) => e,
         None => {
             let e = ort::init().with_name("precog").build().map_err(|e| anyhow::anyhow!("onnxruntime: {e}"))?;
             ENV.get_or_init(|| e)
         }
-    };
+    })
+}
+
+fn session(dir: &Path, name: &str) -> Result<Session> {
+    let env = env()?;
     let path = dir.join(name);
     let threads = std::env::var("PRECOG_ORT_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
     // ort defaults to an "efficiency" device policy, which on Apple silicon is ~9x slower for these small

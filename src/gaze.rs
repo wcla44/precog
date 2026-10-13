@@ -15,7 +15,7 @@ use std::path::Path;
 
 pub const NF: usize = 14;
 /// Bumped whenever the feature vector changes meaning: older saved models then trigger a recalibration.
-pub const FEATURE_VERSION: u32 = 4;
+pub const FEATURE_VERSION: u32 = 5;
 /// Columns that get squared / crossed: iris x,y of both eyes, head pitch/yaw.
 const QUAD: [usize; 6] = [0, 1, 3, 4, 6, 7];
 const ALPHAS: [f64; 5] = [0.01, 0.1, 1.0, 10.0, 100.0];
@@ -29,7 +29,10 @@ pub const CLICK_GROUP: i64 = 1000;
 pub struct GazeModel {
     #[serde(default)]
     pub version: u32,
-    pub f: Vec<[f64; NF]>,
+    /// Feature dimension and the columns that get quadratic terms.
+    pub dim: usize,
+    pub quad: Vec<usize>,
+    pub f: Vec<Vec<f64>>,
     pub y: Vec<[f64; 2]>,
     pub g: Vec<i64>,
     pub w: Vec<f64>,
@@ -46,8 +49,8 @@ pub struct GazeModel {
 }
 
 struct Fit {
-    mu: [f64; NF],
-    sd: [f64; NF],
+    mu: Vec<f64>,
+    sd: Vec<f64>,
     coef: DMatrix<f64>, // (n_terms, 2)
     cv_error: f64,
     /// Per-axis (offset, gain) undoing regression shrinkage: with noisy features, ridge predictions are pulled
@@ -74,6 +77,20 @@ pub fn unix_now() -> f64 {
 }
 
 impl GazeModel {
+    /// Landmark features (`tracker::features`): fast (30 fps), noisy, head-pose sensitive.
+    pub fn landmarks() -> Self {
+        Self { version: FEATURE_VERSION, dim: NF, quad: QUAD.to_vec(), ..Default::default() }
+    }
+
+    /// UniGaze (pitch, yaw): slower (~10 Hz) but much more accurate and head-robust.
+    pub fn unigaze() -> Self {
+        Self { version: FEATURE_VERSION, dim: 2, quad: vec![0, 1], ..Default::default() }
+    }
+
+    pub fn ready(&self) -> bool {
+        self.fit.is_some()
+    }
+
     pub fn cv_error(&self) -> f64 {
         self.fit.as_ref().map_or(f64::NAN, |f| f.cv_error)
     }
@@ -82,9 +99,10 @@ impl GazeModel {
         self.f.len()
     }
 
-    pub fn add(&mut self, feats: &[[f64; NF]], point: [f64; 2], group: i64, weight: f64) {
+    pub fn add<F: AsRef<[f64]>>(&mut self, feats: &[F], point: [f64; 2], group: i64, weight: f64) {
         for x in feats {
-            self.f.push(*x);
+            debug_assert_eq!(x.as_ref().len(), self.dim);
+            self.f.push(x.as_ref().to_vec());
             self.y.push(point);
             self.g.push(group);
             self.w.push(weight);
@@ -119,14 +137,14 @@ impl GazeModel {
         }
     }
 
-    fn expand(mu: &[f64; NF], sd: &[f64; NF], x: &[f64; NF]) -> Vec<f64> {
-        let z: Vec<f64> = (0..NF).map(|i| (x[i] - mu[i]) / sd[i]).collect();
-        let mut row = Vec::with_capacity(1 + NF + QUAD.len() * (QUAD.len() + 1) / 2);
+    fn expand(quad: &[usize], mu: &[f64], sd: &[f64], x: &[f64]) -> Vec<f64> {
+        let z: Vec<f64> = (0..mu.len()).map(|i| (x[i] - mu[i]) / sd[i]).collect();
+        let mut row = Vec::with_capacity(1 + z.len() + quad.len() * (quad.len() + 1) / 2);
         row.push(1.0);
         row.extend_from_slice(&z);
-        for i in 0..QUAD.len() {
-            for j in i..QUAD.len() {
-                row.push(z[QUAD[i]] * z[QUAD[j]]);
+        for i in 0..quad.len() {
+            for j in i..quad.len() {
+                row.push(z[quad[i]] * z[quad[j]]);
             }
         }
         row
@@ -182,13 +200,14 @@ impl GazeModel {
         }
         self.ts.resize(n, unix_now());
         let w = self.weights();
-        let mut mu = [0.0; NF];
-        let mut sd = [0.0; NF];
-        for i in 0..NF {
+        let d = self.dim;
+        let mut mu = vec![0.0; d];
+        let mut sd = vec![0.0; d];
+        for i in 0..d {
             mu[i] = self.f.iter().map(|x| x[i]).sum::<f64>() / n as f64;
             sd[i] = (self.f.iter().map(|x| (x[i] - mu[i]).powi(2)).sum::<f64>() / n as f64).sqrt() + 1e-6;
         }
-        let rows: Vec<Vec<f64>> = self.f.iter().map(|x| Self::expand(&mu, &sd, x)).collect();
+        let rows: Vec<Vec<f64>> = self.f.iter().map(|x| Self::expand(&self.quad, &mu, &sd, x)).collect();
         let p = rows[0].len();
         let x = DMatrix::from_fn(n, p, |r, c| rows[r][c]);
         let y = DMatrix::from_fn(n, 2, |r, c| self.y[r][c]);
@@ -237,9 +256,9 @@ impl GazeModel {
         Ok(best.0)
     }
 
-    pub fn predict(&self, x: &[f64; NF]) -> Option<(f64, f64)> {
+    pub fn predict(&self, x: &[f64]) -> Option<(f64, f64)> {
         let f = self.fit.as_ref()?;
-        let row = DVector::from_vec(Self::expand(&f.mu, &f.sd, x));
+        let row = DVector::from_vec(Self::expand(&self.quad, &f.mu, &f.sd, x));
         let p = row.transpose() * &f.coef;
         let [(ox, gx), (oy, gy)] = f.stretch;
         Some((ox + gx * p[0], oy + gy * p[1]))
@@ -269,11 +288,11 @@ impl GazeModel {
 
 /// Instant local correction from recent clicks: residual = click position - model prediction, blended by
 /// proximity on screen and age. One click right next to the gaze corrects about half of its residual.
-pub struct ClickCorrector {
-    clicks: VecDeque<(f64, [f64; 2], [f64; NF], [f64; 2])>, // (time, click position, mean features, residual)
+pub struct ClickCorrector<T> {
+    clicks: VecDeque<(f64, [f64; 2], T, [f64; 2])>, // (time, click position, model inputs at the click, residual)
 }
 
-impl ClickCorrector {
+impl<T> ClickCorrector<T> {
     const KEEP: usize = 40;
     const SIGMA: f64 = 350.0; // px: how far a click's correction reaches
     const TAU: f64 = 900.0; // s: how long it lasts
@@ -283,17 +302,17 @@ impl ClickCorrector {
         Self { clicks: VecDeque::new() }
     }
 
-    pub fn add(&mut self, t: f64, pos: [f64; 2], feats: [f64; NF]) {
+    pub fn add(&mut self, t: f64, pos: [f64; 2], feats: T) {
         self.clicks.push_back((t, pos, feats, [0.0; 2]));
         while self.clicks.len() > Self::KEEP {
             self.clicks.pop_front();
         }
     }
 
-    /// Recompute residuals against the current model (call after every refit).
-    pub fn update_residuals(&mut self, model: &GazeModel) {
+    /// Recompute residuals against the current predictor (call after every refit).
+    pub fn update_residuals(&mut self, predict: impl Fn(&T) -> Option<(f64, f64)>) {
         for c in self.clicks.iter_mut() {
-            if let Some((px, py)) = model.predict(&c.2) {
+            if let Some((px, py)) = predict(&c.2) {
                 c.3 = [c.1[0] - px, c.1[1] - py];
             }
         }
@@ -472,7 +491,7 @@ mod tests {
             f[1] = p[1] / 1000.0 + rng.random_range(-0.02..0.02);
             f
         };
-        let mut m = GazeModel::default();
+        let mut m = GazeModel::landmarks();
         for g in 0..9 {
             let p = [200.0 + 500.0 * (g % 3) as f64, 150.0 + 300.0 * (g / 3) as f64];
             let fs: Vec<_> = (0..20).map(|_| feat(p, 0.0, &mut rng)).collect();
@@ -504,7 +523,7 @@ mod tests {
             m.add(&fs, p, CLICK_GROUP + k, 1.0);
             corr.add(0.0, p, mean);
             m.refit().unwrap();
-            corr.update_residuals(&m);
+            corr.update_residuals(|f: &[f64; NF]| m.predict(f));
         }
         let after = err(&m, &corr, &mut rng);
         println!("mean error after drift: {before:.0}px -> after 15 clicks: {after:.0}px");
@@ -513,7 +532,7 @@ mod tests {
 
     #[test]
     fn fits_synthetic() {
-        let mut m = GazeModel::default();
+        let mut m = GazeModel::landmarks();
         let mut rng = rand::rngs::StdRng::seed_from_u64(1);
         use rand::Rng;
         for g in 0..16 {

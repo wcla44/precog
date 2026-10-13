@@ -19,6 +19,7 @@ screenshot of the monitor you look at + gaze trail ─► LLM (vision) ─► su
 
 ```bash
 scripts/convert_models.sh      # one-off: MediaPipe .task -> models/onnx/*.onnx (needs uv)
+scripts/fetch_unigaze.sh       # optional, recommended: UniGaze gaze model (~89 MB int8, non-commercial license)
 cargo build --release
 ./target/release/precog
 ```
@@ -64,6 +65,8 @@ Command-line flags (they apply to this run only): `--calibrate`, `--no-agent`, `
 - `~/.cache/precog/last_screen.jpg`: the last screenshot sent to the LLM. Only written when `PRECOG_DEBUG=1`.
 
 **Gaze smudge**: where you look is shown as a soft, animated haze. The centre is see-through, so you can still read what you're looking at. Its size reflects how noisy the gaze currently is.
+
+**UniGaze** ([ut-vision/UniGaze](https://github.com/ut-vision/UniGaze), 2025) is an optional appearance-based gaze model, run with ONNX Runtime at about 10Hz. On a real two-screen calibration recording it cut the error from 269 to 156px per dot (162px with the int8 model), and it is much more robust to head movement. Its weights are non-commercial: `scripts/fetch_unigaze.sh` downloads and converts them locally, and they are never committed.
 
 ## How it works
 

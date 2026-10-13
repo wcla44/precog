@@ -21,6 +21,7 @@ precog is a gaze-aware desktop assistant, written in Rust, for macOS and Linux (
 
 ```bash
 scripts/convert_models.sh   # one-off: MediaPipe .task -> models/onnx/*.onnx (gitignored, needs uv)
+scripts/fetch_unigaze.sh    # optional: UniGaze int8 ONNX (non-commercial weights: never commit them)
 cargo build                 # dev profile is optimised (opt-level 2): the vision models are slow unoptimised
 cargo test
 ./target/debug/precog --test-llm                  # screenshot -> LLM -> printed suggestion, no camera
@@ -40,7 +41,8 @@ cargo test
 | `src/vision.rs` | ONNX face mesh (478 points incl. iris) and hand landmarks: anchors, rotated ROI crops, tracking |
 | `src/tracker.rs` | camera thread, gaze features, swipe detection, click polling |
 | `src/camera_mac.rs` | native AVFoundation capture (nokhwa never delivers frames on macOS) |
-| `src/gaze.rs` | ridge-regression gaze model with grouped CV, One-Euro filter |
+| `src/gaze.rs` | ridge-regression gaze models (landmarks, UniGaze) with grouped CV, click corrector, fixation filter |
+| `src/unigaze.rs` | UniGaze: PnP head pose, ETH-XGaze face normalisation, int8 ONNX inference |
 | `src/gestures.rs` | pose classification (open / fist / pinch), swipes, debounce |
 | `src/dictation.rs` | microphone (cpal) → whisper.cpp → typed text |
 | `src/agent.rs`, `src/llm.rs` | fixation trigger, screenshot + gaze trail, providers (Anthropic, Claude CLI, OpenAI-compatible) |

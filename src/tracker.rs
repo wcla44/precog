@@ -22,10 +22,21 @@ pub struct Frame {
     pub crop: Option<Arc<Vec<u8>>>,
 }
 
+/// One UniGaze result: gaze angles for the frame captured at `t`, plus that frame's landmark features
+/// (so the fast landmark model can carry the estimate forward until the next UniGaze result).
+#[derive(Clone)]
+pub struct UgSample {
+    pub t: f64,
+    pub angles: [f64; 2],
+    pub land: Option<[f64; NF]>,
+}
+
 #[derive(Default)]
 pub struct Shared {
     pub latest: Option<Frame>,
     pub history: VecDeque<Frame>,
+    pub ug: VecDeque<UgSample>,
+    pub ug_enabled: bool,
     pub fps: f32,
     pub error: Option<String>,
 }
@@ -134,6 +145,21 @@ impl Tracker {
             .collect()
     }
 
+    pub fn ug_latest(&self) -> Option<UgSample> {
+        self.shared.lock().ug.back().cloned()
+    }
+
+    pub fn ug_between(&self, t0: f64, t1: f64) -> Vec<UgSample> {
+        self.shared.lock().ug.iter().filter(|u| u.t >= t0 && u.t <= t1).cloned().collect()
+    }
+
+    /// UniGaze results per second over the last 3 s (0 when unavailable).
+    pub fn ug_rate(&self) -> f64 {
+        let s = self.shared.lock();
+        let now = now();
+        s.ug.iter().filter(|u| now - u.t < 3.0).count() as f64 / 3.0
+    }
+
     pub fn features_between(&self, t0: f64, t1: f64) -> Vec<[f64; NF]> {
         self.shared.lock().history.iter().filter(|f| f.t >= t0 && f.t <= t1).filter_map(|f| f.features).collect()
     }
@@ -142,13 +168,44 @@ impl Tracker {
 fn run(
     camera: u32,
     models: &std::path::Path,
-    shared: &Mutex<Shared>,
+    shared_arc: &Arc<Mutex<Shared>>,
     swipe_tx: Sender<(f64, Swipe)>,
     use_hands: Arc<AtomicBool>,
     mirrored: Arc<AtomicBool>,
     record: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
+    let shared: &Mutex<Shared> = shared_arc;
     let mut face = FaceMesh::new(models)?;
+    // UniGaze on its own thread, fed with the newest frame whenever it is free (~10 Hz)
+    let (ug_tx, ug_rx) = crossbeam_channel::bounded::<(f64, Vec<f32>, Option<[f64; NF]>)>(1);
+    let ug_path = crate::unigaze::UniGaze::path(models);
+    if ug_path.exists() {
+        let shared_ug = shared_arc.clone();
+        let models = models.to_path_buf();
+        std::thread::Builder::new()
+            .name("unigaze".into())
+            .spawn(move || {
+                let mut ug = match crate::unigaze::UniGaze::new(&models, 3) {
+                    Ok(u) => u,
+                    Err(e) => return eprintln!("UniGaze unavailable: {e:#}"),
+                };
+                shared_ug.lock().ug_enabled = true;
+                for (t, chw, land) in ug_rx {
+                    match ug.run(chw) {
+                        Ok((p, y)) => {
+                            let mut s = shared_ug.lock();
+                            s.ug.push_back(UgSample { t, angles: [p as f64, y as f64], land });
+                            while s.ug.len() > 200 {
+                                s.ug.pop_front();
+                            }
+                        }
+                        Err(e) => eprintln!("UniGaze: {e:#}"),
+                    }
+                }
+            })?;
+    } else {
+        eprintln!("UniGaze model not found ({}): run scripts/fetch_unigaze.sh for better accuracy", ug_path.display());
+    }
     let mut iris = IrisModel::new(models).map_err(|e| eprintln!("iris model unavailable ({e:#}): using face-mesh iris")).ok();
     let mut hands: Option<HandTracker> = None;
     let cam = Cam::open(camera).map_err(|e| {
@@ -169,6 +226,13 @@ fn run(
             p[473][..2].copy_from_slice(&l);
         }
         let feats = mesh.as_ref().map(|p| features(p, w, h));
+        if let Some(p) = mesh.as_ref() {
+            if ug_tx.is_empty() {
+                if let Some(chw) = crate::unigaze::normalize(&rgb, p) {
+                    let _ = ug_tx.try_send((t, chw, feats));
+                }
+            }
+        }
         let crop = match (&mesh, record.load(Ordering::Relaxed)) {
             (Some(p), true) => face_jpeg(&img.data, w, h, p).map(Arc::new),
             _ => None,

@@ -29,6 +29,10 @@ pub fn gaze_model() -> PathBuf {
     data_dir().join("gaze_model.json")
 }
 
+pub fn gaze_model_unigaze() -> PathBuf {
+    data_dir().join("gaze_model_unigaze.json")
+}
+
 /// ONNX models: $PRECOG_MODELS, else ./models/onnx next to the binary's repo, else the data dir.
 pub fn onnx_dir() -> PathBuf {
     if let Some(p) = std::env::var_os("PRECOG_MODELS") {
