@@ -48,7 +48,7 @@ impl Calibration {
             // 3x3 per screen in a snake path: predictable, so the eyes get there fast
             let pts = (0..9).map(|k| {
                 let (row, col) = (k / 3, if (k / 3) % 2 == 0 { k % 3 } else { 2 - k % 3 });
-                let (fx, fy) = (0.06 + 0.44 * col as f64, 0.08 + 0.42 * row as f64);
+                let (fx, fy) = (0.04 + 0.46 * col as f64, 0.04 + 0.46 * row as f64); // close to the edges
                 (mi, m.left as f64 + fx * m.width as f64, m.top as f64 + fy * m.height as f64)
             });
             points.extend(pts);
@@ -650,14 +650,20 @@ impl PrecogApp {
             return;
         }
         let s = cloud::SIZE;
+        // Keep the window inside the monitor (macOS pushes windows that stick out above the screen back down,
+        // which made the smudge stop short of the top) and draw the smudge offset inside it instead.
+        let m = monitors::at(&self.monitors, x, y);
+        let wx = (x as f32 - s / 2.0).clamp(m.left as f32, (m.right() as f32 - s).max(m.left as f32));
+        let wy = (y as f32 - s / 2.0).clamp(m.top as f32, (m.bottom() as f32 - s).max(m.top as f32));
+        let local = Pos2::new(x as f32 - wx, y as f32 - wy);
         let smudge = &mut self.smudge;
         // click-through, so it never needs to dodge the cursor
         ctx.show_viewport_immediate(
             ViewportId::from_hash_of("gaze"),
-            overlay("precog gaze", [s, s], [x as f32 - s / 2.0, y as f32 - s / 2.0]).with_mouse_passthrough(true),
+            overlay("precog gaze", [s, s], [wx, wy]).with_mouse_passthrough(true),
             |ui, _| {
                 let ctx = ui.ctx().clone();
-                egui::CentralPanel::no_frame().show(ui, |ui| smudge.paint(&ctx, ui.painter(), Pos2::new(s / 2.0, s / 2.0), now()));
+                egui::CentralPanel::no_frame().show(ui, |ui| smudge.paint(&ctx, ui.painter(), local, now()));
             },
         );
     }

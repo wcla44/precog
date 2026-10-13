@@ -50,6 +50,23 @@ struct Fit {
     sd: [f64; NF],
     coef: DMatrix<f64>, // (n_terms, 2)
     cv_error: f64,
+    /// Per-axis (offset, gain) undoing regression shrinkage: with noisy features, ridge predictions are pulled
+    /// towards the middle of the screen (the gaze "can't reach" the edges). Fitted on held-out predictions.
+    stretch: [(f64, f64); 2],
+}
+
+/// Least-squares target = offset + gain * prediction on one axis, gain limited to [1, 1.6]: only ever expands.
+fn stretch_axis(pairs: &[([f64; 2], [f64; 2])], axis: usize) -> (f64, f64) {
+    let n = pairs.len() as f64;
+    if n < 10.0 {
+        return (0.0, 1.0);
+    }
+    let mp = pairs.iter().map(|p| p.0[axis]).sum::<f64>() / n;
+    let mt = pairs.iter().map(|p| p.1[axis]).sum::<f64>() / n;
+    let cov = pairs.iter().map(|p| (p.0[axis] - mp) * (p.1[axis] - mt)).sum::<f64>();
+    let var = pairs.iter().map(|p| (p.0[axis] - mp).powi(2)).sum::<f64>().max(1e-9);
+    let gain = (cov / var).clamp(1.0, 1.6);
+    (mt - gain * mp, gain)
 }
 
 pub fn unix_now() -> f64 {
@@ -180,7 +197,8 @@ impl GazeModel {
         if !cross_validate && self.alpha > 0.0 {
             let Some(coef) = Self::solve(&x, &y, &w, &all, self.alpha) else { bail!("singular system") };
             let cv_error = self.cv_error();
-            self.fit = Some(Fit { mu, sd, coef, cv_error });
+            let stretch = self.fit.as_ref().map_or([(0.0, 1.0); 2], |f| f.stretch);
+            self.fit = Some(Fit { mu, sd, coef, cv_error, stretch });
             return Ok(cv_error);
         }
         let mut groups: Vec<i64> = self.g.clone();
@@ -190,15 +208,17 @@ impl GazeModel {
         let k = groups.len().min(5);
         let folds: Vec<Vec<i64>> = (0..k).map(|i| groups.iter().skip(i).step_by(k).copied().collect()).collect();
 
-        let mut best = (f64::INFINITY, 1.0);
+        let mut best = (f64::INFINITY, 1.0, Vec::new());
         for alpha in ALPHAS {
             let mut errs = Vec::with_capacity(n);
+            let mut held_out = Vec::with_capacity(n); // (prediction, target) for rows never seen in training
             for fold in &folds {
                 let (te, tr): (Vec<usize>, Vec<usize>) = (0..n).partition(|&r| fold.contains(&self.g[r]));
                 let Some(c) = Self::solve(&x, &y, &w, &tr, alpha) else { continue };
                 for r in te {
                     let pred = x.row(r) * &c;
                     errs.push(((pred[0] - y[(r, 0)]).powi(2) + (pred[1] - y[(r, 1)]).powi(2)).sqrt());
+                    held_out.push(([pred[0], pred[1]], [y[(r, 0)], y[(r, 1)]]));
                 }
             }
             if errs.is_empty() {
@@ -207,12 +227,13 @@ impl GazeModel {
             errs.sort_by(f64::total_cmp);
             let med = errs[errs.len() / 2];
             if med < best.0 {
-                best = (med, alpha);
+                best = (med, alpha, held_out);
             }
         }
         let Some(coef) = Self::solve(&x, &y, &w, &all, best.1) else { bail!("singular system") };
         self.alpha = best.1;
-        self.fit = Some(Fit { mu, sd, coef, cv_error: best.0 });
+        let stretch = [0, 1].map(|a| stretch_axis(&best.2, a));
+        self.fit = Some(Fit { mu, sd, coef, cv_error: best.0, stretch });
         Ok(best.0)
     }
 
@@ -220,7 +241,8 @@ impl GazeModel {
         let f = self.fit.as_ref()?;
         let row = DVector::from_vec(Self::expand(&f.mu, &f.sd, x));
         let p = row.transpose() * &f.coef;
-        Some((p[0], p[1]))
+        let [(ox, gx), (oy, gy)] = f.stretch;
+        Some((ox + gx * p[0], oy + gy * p[1]))
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
