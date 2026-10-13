@@ -232,7 +232,14 @@ impl GazeModel {
     }
 
     pub fn load(path: &Path) -> Result<Self> {
-        let mut m: Self = serde_json::from_slice(&std::fs::read(path)?)?;
+        let bytes = std::fs::read(path)?;
+        // check the feature version first: older files have a different vector length and would not parse
+        let v: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let version = v.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        if version != FEATURE_VERSION {
+            bail!("gaze features changed since that calibration (v{version} -> v{FEATURE_VERSION})");
+        }
+        let mut m: Self = serde_json::from_value(v)?;
         m.fit()?;
         Ok(m)
     }

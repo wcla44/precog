@@ -920,6 +920,22 @@ fn settings_form(ui: &mut egui::Ui, c: &mut Settings, custom_model: &mut String,
     ui.label(egui::RichText::new(format!("Saved to {} (mode 600)", crate::settings::path().display())).small().color(Color32::GRAY));
 }
 
+impl Drop for PrecogApp {
+    fn drop(&mut self) {
+        if let Some(m) = &self.model {
+            let _ = m.save(&paths::gaze_model()); // keep what the clicks taught
+        }
+        if self.n_clicks > 0 {
+            println!(
+                "session: learned from {} clicks, median gaze error at the last {} clicks: {:.0}px",
+                self.n_clicks,
+                self.click_errs.len(),
+                median(&self.click_errs)
+            );
+        }
+    }
+}
+
 impl eframe::App for PrecogApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.step(ctx);
