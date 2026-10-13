@@ -7,6 +7,7 @@ license = "GPL-3.0-only"
 
 [dependencies]
 anyhow = "1"
+arboard = "3" # clipboard: halo captures
 base64 = "0.22"
 crossbeam-channel = "0.5"
 device_query = "4"
@@ -42,6 +43,7 @@ whisper-rs = { version = "0.16", features = ["metal"] }
 winit = "0.30"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", features = ["shape", "randr"] } # halo without a compositor: clip the window to its ring
 gtk = "0.18"
 nokhwa = { version = "0.10", features = ["input-native"] }
 whisper-rs = "0.16"

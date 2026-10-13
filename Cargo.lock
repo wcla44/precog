@@ -4179,6 +4179,7 @@ name = "precog"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "arboard",
  "base64 0.22.1",
  "clap",
  "core-foundation 0.10.1",
@@ -4209,6 +4210,7 @@ dependencies = [
  "tray-icon",
  "whisper-rs",
  "winit",
+ "x11rb",
  "xcap",
 ]
 

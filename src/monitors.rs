@@ -8,6 +8,10 @@ pub struct Monitor {
     pub width: u32,
     pub height: u32,
     pub primary: bool,
+    /// Physical size (mm) as reported by the screen (EDID), when it does: context for the gaze layout.
+    pub mm: Option<(f64, f64)>,
+    /// The laptop's own panel (eDP, LVDS, DSI; macOS: built-in display): the webcam sits in its bezel.
+    pub builtin: bool,
 }
 
 impl Monitor {
@@ -28,12 +32,19 @@ impl Monitor {
     }
 }
 
+/// The screen whose bezel holds the webcam: the built-in panel, else the primary screen. Returned first, the others
+/// in their usual order (the geometric gaze model anchors the camera to the first screen).
+pub fn camera_first(mons: &[Monitor]) -> Vec<Monitor> {
+    let cam = mons.iter().position(|m| m.builtin).unwrap_or(0);
+    std::iter::once(mons[cam]).chain(mons.iter().enumerate().filter(|(i, _)| *i != cam).map(|(_, m)| *m)).collect()
+}
+
 /// Primary monitor first.
 pub fn list() -> Vec<Monitor> {
     let mut out = platform_list();
     out.sort_by_key(|m| !m.primary);
     if out.is_empty() {
-        out.push(Monitor { left: 0, top: 0, width: 1440, height: 900, primary: true });
+        out.push(Monitor { left: 0, top: 0, width: 1440, height: 900, primary: true, mm: None, builtin: true });
     }
     out
 }
@@ -48,12 +59,15 @@ fn platform_list() -> Vec<Monitor> {
         .map(|id| {
             let d = CGDisplay::new(id);
             let b = d.bounds();
+            let mm = d.screen_size();
             Monitor {
                 left: b.origin.x as i32,
                 top: b.origin.y as i32,
                 width: b.size.width as u32,
                 height: b.size.height as u32,
                 primary: d.is_main(),
+                mm: (mm.width > 0.0 && mm.height > 0.0).then_some((mm.width, mm.height)),
+                builtin: d.is_builtin(),
             }
         })
         .collect()
@@ -61,17 +75,44 @@ fn platform_list() -> Vec<Monitor> {
 
 #[cfg(not(target_os = "macos"))]
 fn platform_list() -> Vec<Monitor> {
+    let mm = randr_sizes();
     xcap::Monitor::all()
         .unwrap_or_default()
         .iter()
         .filter_map(|m| {
+            let (left, top, width, height) = (m.x().ok()?, m.y().ok()?, m.width().ok()?, m.height().ok()?);
             Some(Monitor {
-                left: m.x().ok()?,
-                top: m.y().ok()?,
-                width: m.width().ok()?,
-                height: m.height().ok()?,
+                left,
+                top,
+                width,
+                height,
                 primary: m.is_primary().unwrap_or(false),
+                mm: mm.iter().find(|(r, ..)| *r == (left, top, width, height)).map(|(_, s, _)| *s),
+                builtin: mm.iter().find(|(r, ..)| *r == (left, top, width, height)).is_some_and(|(.., b)| *b),
             })
+        })
+        .collect()
+}
+
+/// XRandR: physical size (mm) of each active output and whether it is the built-in panel, keyed by its rect.
+#[cfg(not(target_os = "macos"))]
+fn randr_sizes() -> Vec<((i32, i32, u32, u32), (f64, f64), bool)> {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::randr::ConnectionExt;
+    let Ok((conn, screen)) = x11rb::connect(None) else { return Vec::new() };
+    let root = conn.setup().roots[screen].root;
+    let Some(res) = conn.randr_get_screen_resources_current(root).ok().and_then(|c| c.reply().ok()) else { return Vec::new() };
+    res.outputs
+        .iter()
+        .filter_map(|&o| {
+            let out = conn.randr_get_output_info(o, res.config_timestamp).ok()?.reply().ok()?;
+            if out.crtc == 0 || out.mm_width == 0 || out.mm_height == 0 {
+                return None;
+            }
+            let crtc = conn.randr_get_crtc_info(out.crtc, res.config_timestamp).ok()?.reply().ok()?;
+            let name = String::from_utf8_lossy(&out.name).to_ascii_lowercase();
+            let builtin = ["edp", "lvds", "dsi"].iter().any(|p| name.starts_with(p));
+            Some(((crtc.x as i32, crtc.y as i32, crtc.width as u32, crtc.height as u32), (out.mm_width as f64, out.mm_height as f64), builtin))
         })
         .collect()
 }

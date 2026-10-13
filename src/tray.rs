@@ -12,6 +12,7 @@ pub enum Cmd {
     Toggle(&'static str), // settings key
     Ask,
     Calibrate,
+    QuickCalibrate,
     Settings,
     Quit,
 }
@@ -66,12 +67,13 @@ fn build(cfg: &Settings) -> anyhow::Result<(Items, Ids)> {
     let check = |label: &str, on: bool| CheckMenuItem::new(label, true, on, None);
     let checks: Vec<(&'static str, CheckMenuItem)> = vec![
         ("agent", check("Suggestions on", cfg.agent)),
-        ("dot", check("Show gaze cloud", cfg.dot)),
+        ("dot", check("Show gaze halo", cfg.dot)),
         ("gesture", check("Hand gestures", cfg.gesture)),
         ("voice", check("✋ Open hand → voice typing", cfg.voice)),
         ("learn", check("Learn from my clicks", cfg.learn)),
     ];
     let ask = MenuItem::new("Ask now", true, None);
+    let quick = MenuItem::new("Quick recalibration (~6 s)", true, None);
     let calibrate = MenuItem::new("Recalibrate (train)…", true, None);
     let settings = MenuItem::new("Settings…", true, None);
     let quit = MenuItem::new("Quit precog", true, None);
@@ -88,6 +90,7 @@ fn build(cfg: &Settings) -> anyhow::Result<(Items, Ids)> {
     }
     menu.append(&hint)?;
     menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&quick)?;
     menu.append(&calibrate)?;
     menu.append(&settings)?;
     menu.append(&PredefinedMenuItem::separator())?;
@@ -95,15 +98,17 @@ fn build(cfg: &Settings) -> anyhow::Result<(Items, Ids)> {
 
     let mut map: Vec<(MenuId, Cmd)> = checks.iter().map(|(k, c)| (c.id().clone(), Cmd::Toggle(k))).collect();
     map.push((ask.id().clone(), Cmd::Ask));
+    map.push((quick.id().clone(), Cmd::QuickCalibrate));
     map.push((calibrate.id().clone(), Cmd::Calibrate));
     map.push((settings.id().clone(), Cmd::Settings));
     map.push((quit.id().clone(), Cmd::Quit));
 
-    let icon = TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
-        .with_icon_templated(eye_icon(cfg.agent))
-        .with_tooltip("precog")
-        .build()?;
+    let builder = TrayIconBuilder::new().with_menu(Box::new(menu)).with_tooltip("precog");
+    #[cfg(target_os = "macos")]
+    let builder = builder.with_icon_templated(eye_icon(cfg.agent));
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.with_icon(eye_icon(cfg.agent)); // templated icons are macOS-only
+    let icon = builder.build()?;
     Ok((Items { status, checks, icon }, Ids { map }))
 }
 
@@ -115,7 +120,10 @@ impl Items {
                 for (k, c) in &self.checks {
                     c.set_checked(get_bool(&cfg, k));
                 }
+                #[cfg(target_os = "macos")]
                 let _ = self.icon.set_icon_templated(Some(eye_icon(cfg.agent)));
+                #[cfg(not(target_os = "macos"))]
+                let _ = self.icon.set_icon(Some(eye_icon(cfg.agent)));
             }
         }
     }

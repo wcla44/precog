@@ -26,6 +26,7 @@ cargo build                 # dev profile is optimised (opt-level 2): the vision
 cargo test
 ./target/debug/precog --test-llm                  # screenshot -> LLM -> printed suggestion, no camera
 ./target/debug/precog --dump-landmarks img.jpg    # run the face/hand models on an image, print JSON
+./target/debug/precog --capture X,Y,R             # copy what's under a halo there (moves the mouse!), print it
 ```
 
 - The toolchain is pinned in `rust-toolchain.toml` (egui needs Rust ≥ 1.95).
@@ -37,13 +38,18 @@ cargo test
 | File | Role |
 |---|---|
 | `src/main.rs` | CLI, macOS camera permission prompt, eframe startup |
-| `src/ui.rs` | egui app: HUD, gaze ring, multi-monitor calibration, suggestion popup, voice overlay, settings window, gesture state machine |
-| `src/vision.rs` | ONNX face mesh (478 points incl. iris) and hand landmarks: anchors, rotated ROI crops, tracking |
-| `src/tracker.rs` | camera thread, gaze features, swipe detection, click polling |
+| `src/ui.rs` | egui app: HUD, gaze halo (smudge or shaped ring), multi-monitor and quick calibration, suggestion popup, voice overlay, settings window, gesture state machine |
+| `src/vision.rs` | ONNX face mesh (478 points incl. iris), iris model, and two-hand landmarks with handedness: anchors, NMS, rotated ROI crops, tracking |
+| `src/tracker.rs` | camera thread, gaze features, UniGaze and hands threads, swipe and head-shake detection, click polling |
 | `src/camera_mac.rs` | native AVFoundation capture (nokhwa never delivers frames on macOS) |
+| `src/geo.rs`, `src/layout.rs` | geometric gaze model: eyes and screens in 3D (camera frame), ray-screen intersection; physical screen arrangements (system layout + mm sizes) as starting points |
+| `src/calib.rs` | two-phase calibration (laser dots with clicks, smooth pursuit with lag alignment and held-out error), quick recalibration |
 | `src/gaze.rs` | ridge-regression gaze models (landmarks, UniGaze) with grouped CV, click corrector, fixation filter |
 | `src/unigaze.rs` | UniGaze: PnP head pose, ETH-XGaze face normalisation, int8 ONNX inference |
-| `src/gestures.rs` | pose classification (open / fist / pinch), swipes, debounce |
+| `src/gestures.rs` | pose classification (open / fist / pinch), hand openness, swipes, head shake, debounce |
+| `src/halo.rs` | gaze halo: stays put inside, glides to new spots, left-hand resize and freeze |
+| `src/capture.rs` | copy under the halo: X11 selection drag, OCR (tesseract), or image → clipboard |
+| `src/xshape.rs` | Linux: compositor detection, halo window clipped to its ring (X11 SHAPE) |
 | `src/dictation.rs` | microphone (cpal) → whisper.cpp → typed text |
 | `src/agent.rs`, `src/llm.rs` | fixation trigger, screenshot + gaze trail, providers (Anthropic, Claude CLI, OpenAI-compatible) |
 | `src/actions.rs` | executing suggested actions, focusing the window under the gaze |

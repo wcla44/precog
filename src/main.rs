@@ -2,12 +2,18 @@
 
 mod actions;
 mod agent;
+mod calib;
 mod cloud;
 #[cfg(target_os = "macos")]
 mod camera_mac;
 mod dictation;
 mod gaze;
 mod gestures;
+mod halo;
+mod layout;
+mod replay;
+mod geo;
+mod capture;
 mod llm;
 mod monitors;
 mod paths;
@@ -15,6 +21,8 @@ mod settings;
 mod tracker;
 mod tray;
 mod unigaze;
+#[cfg(target_os = "linux")]
+mod xshape;
 mod ui;
 mod vision;
 
@@ -64,10 +72,22 @@ struct Args {
     /// Debug: UniGaze on an image: print (pitch, yaw), write the normalised face next to it
     #[arg(long, hide = true)]
     unigaze: Option<std::path::PathBuf>,
+    /// Debug: evaluate gaze model variants on a recorded calibration (~/.local/share/precog/calibrations/*.json)
+    #[arg(long, hide = true)]
+    replay: Option<std::path::PathBuf>,
+    /// Debug: copy what's under a halo at X,Y with radius R (global coordinates) to the clipboard, then exit
+    #[arg(long, hide = true, value_delimiter = ',')]
+    capture: Option<Vec<f64>>,
 }
 
 fn main() -> anyhow::Result<()> {
     now();
+    // X11: our coordinates are physical pixels (xcap, xdotool), but winit derives a per-monitor scale factor from the
+    // screen size in mm, which would scale every window position and size. Keep 1 point = 1 pixel unless overridden.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WINIT_X11_SCALE_FACTOR").is_none() {
+        std::env::set_var("WINIT_X11_SCALE_FACTOR", "1");
+    }
     let args = Args::parse();
     if let Some(path) = &args.unigaze {
         let img = image::open(path)?.to_rgb8();
@@ -118,11 +138,11 @@ fn main() -> anyhow::Result<()> {
             iris.process(&rgb, &p).unwrap();
         });
         time("hand", &mut || {
-            hand.process(&rgb).unwrap();
+            hand.process(&rgb, false).unwrap();
         });
         time("hand (reset)", &mut || {
             hand = vision::HandTracker::new(&dir).unwrap();
-            hand.process(&rgb).unwrap();
+            hand.process(&rgb, false).unwrap();
         });
         return Ok(());
     }
@@ -132,14 +152,40 @@ fn main() -> anyhow::Result<()> {
         let rgb = vision::Rgb { w, h, data: img.as_raw() };
         let dir = paths::onnx_dir();
         let face = vision::FaceMesh::new(&dir)?.process(&rgb)?;
-        let hand = vision::HandTracker::new(&dir)?.process(&rgb)?;
+        let hands: Vec<_> = vision::HandTracker::new(&dir)?
+            .process(&rgb, false)?
+            .into_iter()
+            .map(|hd| {
+                let pts: Vec<[f32; 2]> = hd.pts.iter().map(|q| [q[0], q[1]]).collect();
+                serde_json::json!({
+                    "right": hd.right,
+                    "pose": format!("{:?}", gestures::classify(&pts)),
+                    "openness": gestures::openness(&pts),
+                    "landmarks": hd.pts,
+                })
+            })
+            .collect();
         let iris = match &face {
             Some(p) => Some(vision::IrisModel::new(&dir)?.process(&rgb, p)?),
             None => None,
         };
         let feats = face.as_ref().map(|p| tracker::features(p, w, h).to_vec());
-        let pose = hand.as_ref().map(|p| format!("{:?}", gestures::classify(&p.iter().map(|q| [q[0], q[1]]).collect::<Vec<_>>())));
-        println!("{}", serde_json::json!({"face": face, "hand": hand, "iris": iris, "features": feats, "pose": pose}));
+        let patches = face.as_ref().map(|p| vision::eye_patches(&rgb, p).to_vec());
+        println!("{}", serde_json::json!({"face": face, "hands": hands, "iris": iris, "features": feats, "eye_patches": patches}));
+        return Ok(());
+    }
+    if let Some(path) = &args.replay {
+        return replay::run(path);
+    }
+    if let Some(c) = &args.capture {
+        anyhow::ensure!(c.len() == 3, "--capture X,Y,R");
+        let mon = monitors::at(&monitors::list(), c[0], c[1]);
+        let got = capture::capture(c[0], c[1], c[2], &mon)?;
+        println!("{}", got.describe());
+        if let capture::Captured::Text { text, .. } = &got {
+            println!("---\n{text}");
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2)); // keep serving the clipboard a moment
         return Ok(());
     }
     if args.test_llm {
@@ -185,6 +231,7 @@ fn main() -> anyhow::Result<()> {
             .with_taskbar(false)
             .with_active(false)
             .with_resizable(false)
+            .with_override_redirect(true) // X11: keep tiling WMs (i3…) from tiling the HUD
             .with_inner_size([720.0, 52.0])
             .with_position([primary.left as f32 + 12.0, primary.bottom() as f32 - 70.0]),
         ..Default::default()
