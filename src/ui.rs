@@ -33,10 +33,11 @@ struct Calibration {
     model: GazeModel,
     /// Raw landmarks per dot, saved for offline tuning of features / models.
     raw: Vec<serde_json::Value>,
+    /// Dots already re-queued once because the face was not seen.
+    retried: std::collections::HashSet<(usize, i64, i64)>,
 }
 
 impl Calibration {
-    const GRID: usize = 4;
     const SETTLE: f64 = 0.7;
     const SWITCH_SETTLE: f64 = 1.4;
     const COLLECT: f64 = 1.0;
@@ -45,10 +46,11 @@ impl Calibration {
         let mut rng = rand::rng();
         let mut points = Vec::new();
         for (mi, m) in mons.iter().enumerate() {
-            let mut pts: Vec<(usize, f64, f64)> = (0..Self::GRID * Self::GRID)
+            let (cols, rows) = if m.width >= 1800 { (5, 4) } else { (4, 4) }; // wide screens get an extra column
+            let mut pts: Vec<(usize, f64, f64)> = (0..cols * rows)
                 .map(|k| {
-                    let fx = 0.05 + 0.9 * (k % Self::GRID) as f64 / (Self::GRID - 1) as f64;
-                    let fy = 0.05 + 0.9 * (k / Self::GRID) as f64 / (Self::GRID - 1) as f64;
+                    let fx = 0.05 + 0.9 * (k % cols) as f64 / (cols - 1) as f64;
+                    let fy = 0.05 + 0.9 * (k / cols) as f64 / (rows - 1) as f64;
                     (mi, m.left as f64 + fx * m.width as f64, m.top as f64 + fy * m.height as f64)
                 })
                 .collect();
@@ -58,7 +60,7 @@ impl Calibration {
         let mut model = GazeModel::default();
         model.layout = mons.iter().map(|m| m.layout()).collect();
         model.version = FEATURE_VERSION;
-        Self { points, i: None, t0: 0.0, settle: Self::SWITCH_SETTLE, model, raw: Vec::new() }
+        Self { points, i: None, t0: 0.0, settle: Self::SWITCH_SETTLE, model, raw: Vec::new(), retried: Default::default() }
     }
 
     fn start_point(&mut self, i: usize, t: f64) {
@@ -79,10 +81,15 @@ impl Calibration {
         let (mi, x, y) = self.points[i];
         if feats.len() >= 5 {
             self.model.add(&feats, [x, y], i as i64, 1.0);
+        } else if self.retried.insert((mi, x as i64, y as i64)) {
+            self.points.push((mi, x, y)); // face not seen: try this dot again at the end
         }
+        let frames = tracker.raw_between(t0, t1);
+        use base64::Engine;
         self.raw.push(serde_json::json!({
             "monitor": mi, "target": [x, y],
-            "frames": tracker.raw_between(t0, t1).iter().map(|r| r.as_slice().to_vec()).collect::<Vec<_>>(),
+            "frames": frames.iter().map(|f| f.0.as_slice().to_vec()).collect::<Vec<_>>(),
+            "crops": frames.iter().map(|f| f.1.as_ref().map(|j| base64::engine::general_purpose::STANDARD.encode(j.as_slice()))).collect::<Vec<_>>(),
         }));
         if i + 1 >= self.points.len() {
             return true;
@@ -382,6 +389,7 @@ impl PrecogApp {
             self.want_calibration = false;
             self.calib = Some(Calibration::new(&self.monitors));
         }
+        self.tracker.record.store(self.calib.is_some(), Ordering::Relaxed);
         if let Some(c) = &mut self.calib {
             if c.update(t, &self.tracker) {
                 self.finish_calibration(false);
@@ -628,6 +636,7 @@ impl PrecogApp {
         let Some(c) = &self.calib else { return };
         let (cur, t0, settle) = (c.i.map(|i| (i, c.points[i])), c.t0, c.settle);
         let total = c.points.len();
+        let face = self.face;
         let mut start = false;
         let mut abort = false;
         for (mi, m) in self.monitors.iter().enumerate() {
@@ -648,7 +657,7 @@ impl PrecogApp {
                                 Pos2::new(size.x / 2.0, size.y / 2.0),
                                 Align2::CENTER_CENTER,
                                 format!(
-                                    "Calibration · {} screen(s)\n\nFollow each dot with your EYES. Turn your head naturally when it changes screen.\nSit the way you usually work.\n\nCLICK anywhere to start · ESC to cancel",
+                                    "Calibration · {} screen(s)\n\nKeep your eyes on each dot, and while you do, gently move your head a little\n(left/right, up/down, closer/further): it teaches precog to handle head movement.\nSit the way you usually work.\n\nCLICK anywhere to start · ESC to cancel",
                                     self.monitors.len()
                                 ),
                                 FontId::proportional(26.0),
@@ -661,7 +670,10 @@ impl PrecogApp {
                             let c = Pos2::new((x - m.left as f64) as f32, (y - m.top as f64) as f32);
                             p.circle_filled(c, r, RED);
                             p.circle_filled(c, 2.0, Color32::WHITE);
-                            p.text(Pos2::new(size.x / 2.0, 30.0), Align2::CENTER_CENTER, format!("{}/{total}", i + 1), FontId::proportional(14.0), Color32::GRAY);
+                            p.text(Pos2::new(size.x / 2.0, 30.0), Align2::CENTER_CENTER, format!("{}/{total} · eyes on the dot, move your head gently", i + 1), FontId::proportional(14.0), Color32::GRAY);
+                            if !face {
+                                p.text(Pos2::new(size.x / 2.0, 60.0), Align2::CENTER_CENTER, "⚠ face not detected: face the camera, add light", FontId::proportional(18.0), Color32::from_rgb(255, 180, 0));
+                            }
                         }
                         _ => {}
                     }

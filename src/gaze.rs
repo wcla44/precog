@@ -9,11 +9,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::Path;
 
-pub const NF: usize = 14;
+pub const NF: usize = 16;
 /// Bumped whenever the feature vector changes meaning: older saved models then trigger a recalibration.
-pub const FEATURE_VERSION: u32 = 2;
-/// Columns that get squared / crossed: iris x,y of both eyes, pitch, yaw.
-const QUAD: [usize; 6] = [0, 1, 3, 4, 6, 7];
+pub const FEATURE_VERSION: u32 = 3;
+/// Columns that get squared / crossed: iris x,y of both eyes, head pitch/yaw, gaze-net yaw/pitch.
+const QUAD: [usize; 8] = [0, 1, 3, 4, 6, 7, 14, 15];
 const ALPHAS: [f64; 5] = [0.01, 0.1, 1.0, 10.0, 100.0];
 const MAX_CLICK_SAMPLES: usize = 1500;
 pub const CLICK_GROUP: i64 = 1000;
@@ -84,7 +84,7 @@ impl GazeModel {
 
     fn expand(mu: &[f64; NF], sd: &[f64; NF], x: &[f64; NF]) -> Vec<f64> {
         let z: Vec<f64> = (0..NF).map(|i| (x[i] - mu[i]) / sd[i]).collect();
-        let mut row = Vec::with_capacity(1 + NF + 21);
+        let mut row = Vec::with_capacity(1 + NF + QUAD.len() * (QUAD.len() + 1) / 2);
         row.push(1.0);
         row.extend_from_slice(&z);
         for i in 0..QUAD.len() {

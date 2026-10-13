@@ -99,12 +99,17 @@ struct Detector {
 }
 
 impl Detector {
+    /// Detect in the whole frame (letterboxed), like MediaPipe.
     fn detect(&mut self, img: &Rgb) -> Result<Option<Detection>> {
-        // letterbox to a square (MediaPipe keeps the aspect ratio), half-pixel centres like cv2.resize
         let s = img.w.max(img.h) as f32;
-        let (ox, oy) = ((s - img.w as f32) / 2.0, (s - img.h as f32) / 2.0);
-        let k = s / self.size as f32;
-        let m = Affine([k, 0.0, 0.5 * k - 0.5 - ox, 0.0, k, 0.5 * k - 0.5 - oy]);
+        self.detect_in(img, -(s - img.w as f32) / 2.0, -(s - img.h as f32) / 2.0, s)
+    }
+
+    /// Detect inside the square [x0, x0+side] x [y0, y0+side] (image pixels, may extend past the borders).
+    fn detect_in(&mut self, img: &Rgb, x0: f32, y0: f32, side: f32) -> Result<Option<Detection>> {
+        // half-pixel centres like cv2.resize
+        let k = side / self.size as f32;
+        let m = Affine([k, 0.0, 0.5 * k - 0.5 + x0, 0.0, k, 0.5 * k - 0.5 + y0]);
         let signed = self.signed;
         let data = warp(img, m, self.size, |p| if signed { p / 127.5 - 1.0 } else { p / 255.0 });
         let tensor = Tensor::from_array(([1usize, self.size, self.size, 3], data))?;
@@ -124,12 +129,29 @@ impl Detector {
         let r = &reg[best * stride..(best + 1) * stride];
         let sz = self.size as f32;
         let a = self.anchors[best];
-        let to_img = |px: f32, py: f32| (px * s - ox, py * s - oy);
+        let to_img = |px: f32, py: f32| (px * side + x0, py * side + y0);
         let center = to_img(r[0] / sz + a.0, r[1] / sz + a.1);
         let keypoints = (0..self.keypoints)
             .map(|i| to_img(r[4 + 2 * i] / sz + a.0, r[5 + 2 * i] / sz + a.1))
             .collect();
-        Ok(Some(Detection { score, center, size: (r[2] / sz * s, r[3] / sz * s), keypoints }))
+        Ok(Some(Detection { score, center, size: (r[2] / sz * side, r[3] / sz * side), keypoints }))
+    }
+
+    /// Whole frame first; if nothing, zoom on central squares. The short-range face model needs the face to be
+    /// ~25+ px in its 128 px input, i.e. a face under ~250 px wide in a 1280 px frame is often missed otherwise.
+    fn detect_multiscale(&mut self, img: &Rgb) -> Result<Option<Detection>> {
+        if let Some(d) = self.detect(img)? {
+            return Ok(Some(d));
+        }
+        let (w, h) = (img.w as f32, img.h as f32);
+        let m = w.min(h);
+        for (frac, cy) in [(1.0, 0.5), (0.6, 0.45), (0.6, 0.3)] {
+            let side = m * frac;
+            if let Some(d) = self.detect_in(img, (w - side) / 2.0, h * cy - side / 2.0, side)? {
+                return Ok(Some(d));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -162,11 +184,16 @@ fn session(dir: &Path, name: &str) -> Result<Session> {
         }
     };
     let path = dir.join(name);
-    Session::builder(env)?
-        .with_intra_threads(2)
-        .map_err(|e| anyhow::anyhow!("{e}"))?
-        .commit_from_file(&path)
-        .with_context(|| format!("loading {} (run scripts/convert_models.sh)", path.display()))
+    let threads = std::env::var("PRECOG_ORT_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    // ort defaults to an "efficiency" device policy, which on Apple silicon is ~9x slower for these small
+    // models (21 ms vs 2.4 ms for the face mesh): force the plain CPU path.
+    let b = Session::builder(env)?
+        .with_auto_device(ort::session::builder::AutoDevicePolicy::PreferCPU)
+        .and_then(|b| b.with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3))
+        .and_then(|b| b.with_intra_threads(threads))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut b = b;
+    b.commit_from_file(&path).with_context(|| format!("loading {} (run scripts/convert_models.sh)", path.display()))
 }
 
 fn input_name(s: &Session) -> String {
@@ -204,7 +231,7 @@ impl FaceMesh {
         let roi = match self.roi {
             Some(r) => r,
             None => {
-                let Some(d) = self.detector.detect(img)? else { return Ok(None) };
+                let Some(d) = self.detector.detect_multiscale(img)? else { return Ok(None) };
                 let _ = d.score;
                 let (r, l) = (d.keypoints[0], d.keypoints[1]); // right eye -> left eye, target angle 0
                 let angle = norm_angle(-(-(l.1 - r.1)).atan2(l.0 - r.0));
@@ -365,4 +392,68 @@ impl IrisModel {
         }
         Ok(out)
     }
+}
+
+/// Appearance-based gaze network (MobileGaze / L2CS-Net family, MobileOne-S0 trained on Gaze360):
+/// face crop -> gaze yaw / pitch in degrees, *including* head pose. That makes it far more robust to head
+/// movement than iris-in-eye geometry; the per-user calibration then maps these angles to the screen.
+pub struct GazeNet {
+    session: Session,
+    input: String,
+}
+
+const GAZE_IN: usize = 448;
+const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
+const STD: [f32; 3] = [0.229, 0.224, 0.225];
+
+/// Tight face box from the mesh: (x0, y0, w, h).
+pub fn face_box(mesh: &[[f32; 3]]) -> (f32, f32, f32, f32) {
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for p in &mesh[..468] {
+        x0 = x0.min(p[0]);
+        y0 = y0.min(p[1]);
+        x1 = x1.max(p[0]);
+        y1 = y1.max(p[1]);
+    }
+    (x0, y0, x1 - x0, y1 - y0)
+}
+
+impl GazeNet {
+    pub fn new(dir: &Path) -> Result<Self> {
+        let s = session(dir, "mobileone_s0_gaze.onnx")?;
+        Ok(Self { input: input_name(&s), session: s })
+    }
+
+    /// (yaw, pitch) in degrees.
+    pub fn process(&mut self, img: &Rgb, mesh: &[[f32; 3]]) -> Result<(f32, f32)> {
+        let (x0, y0, w, h) = face_box(mesh);
+        // stretch the box to 448x448 like cv2.resize (half-pixel centres)
+        let (kx, ky) = (w / GAZE_IN as f32, h / GAZE_IN as f32);
+        let m = Affine([kx, 0.0, x0 + 0.5 * kx - 0.5, 0.0, ky, y0 + 0.5 * ky - 0.5]);
+        let hwc = warp_rect(img, m, GAZE_IN);
+        let n = GAZE_IN * GAZE_IN;
+        let mut chw = vec![0f32; 3 * n];
+        for (i, px) in hwc.chunks_exact(3).enumerate() {
+            for c in 0..3 {
+                chw[c * n + i] = (px[c] / 255.0 - MEAN[c]) / STD[c];
+            }
+        }
+        let tensor = Tensor::from_array(([1usize, 3, GAZE_IN, GAZE_IN], chw))?;
+        let outputs = self.session.run(ort::inputs![self.input.as_str() => tensor])?;
+        let decode = |logits: &[f32]| {
+            // 90 bins of 4 degrees from -180: expectation over the softmax
+            let mx = logits.iter().copied().fold(f32::MIN, f32::max);
+            let e: Vec<f32> = logits.iter().map(|l| (l - mx).exp()).collect();
+            let sum: f32 = e.iter().sum();
+            e.iter().enumerate().map(|(i, p)| i as f32 * p).sum::<f32>() / sum * 4.0 - 180.0
+        };
+        let (_, yaw) = outputs[0].try_extract_tensor::<f32>()?;
+        let (_, pitch) = outputs[1].try_extract_tensor::<f32>()?;
+        Ok((decode(yaw), decode(pitch)))
+    }
+}
+
+/// Same as `warp` but returns raw 0..255 HWC values (caller normalises).
+fn warp_rect(img: &Rgb, m: Affine, out: usize) -> Vec<f32> {
+    warp(img, m, out, |p| p)
 }

@@ -57,11 +57,49 @@ struct Args {
     /// Debug: run face + hand models on an image and print landmarks as JSON
     #[arg(long, hide = true)]
     dump_landmarks: Option<std::path::PathBuf>,
+    /// Debug: time each vision stage on an image
+    #[arg(long, hide = true)]
+    bench: Option<std::path::PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
     now();
     let args = Args::parse();
+    if let Some(path) = &args.bench {
+        let img = image::open(path)?.to_rgb8();
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let rgb = vision::Rgb { w, h, data: img.as_raw() };
+        let dir = paths::onnx_dir();
+        let (mut face, mut iris, mut hand) = (vision::FaceMesh::new(&dir)?, vision::IrisModel::new(&dir)?, vision::HandTracker::new(&dir)?);
+        let p = face.process(&rgb)?.expect("no face");
+        let n = 50;
+        let time = |name: &str, f: &mut dyn FnMut()| {
+            let t0 = now();
+            for _ in 0..n {
+                f();
+            }
+            println!("{name:>14}: {:6.2} ms", (now() - t0) * 1000.0 / n as f64);
+        };
+        time("face (tracked)", &mut || {
+            face.process(&rgb).unwrap();
+        });
+        time("iris (2 eyes)", &mut || {
+            iris.process(&rgb, &p).unwrap();
+        });
+        let mut gnet = vision::GazeNet::new(&dir)?;
+        println!("gaze net on this face: {:?} (yaw, pitch) deg", gnet.process(&rgb, &p)?);
+        time("gaze net", &mut || {
+            gnet.process(&rgb, &p).unwrap();
+        });
+        time("hand", &mut || {
+            hand.process(&rgb).unwrap();
+        });
+        time("hand (reset)", &mut || {
+            hand = vision::HandTracker::new(&dir).unwrap();
+            hand.process(&rgb).unwrap();
+        });
+        return Ok(());
+    }
     if let Some(path) = &args.dump_landmarks {
         let img = image::open(path)?.to_rgb8();
         let (w, h) = (img.width() as usize, img.height() as usize);
@@ -73,7 +111,11 @@ fn main() -> anyhow::Result<()> {
             Some(p) => Some(vision::IrisModel::new(&dir)?.process(&rgb, p)?),
             None => None,
         };
-        let feats = face.as_ref().map(|p| tracker::features(p, w, h).to_vec());
+        let net = match &face {
+            Some(p) => vision::GazeNet::new(&dir)?.process(&rgb, p)?,
+            None => (0.0, 0.0),
+        };
+        let feats = face.as_ref().map(|p| tracker::features(p, w, h, net).to_vec());
         let pose = hand.as_ref().map(|p| format!("{:?}", gestures::classify(&p.iter().map(|q| [q[0], q[1]]).collect::<Vec<_>>())));
         println!("{}", serde_json::json!({"face": face, "hand": hand, "iris": iris, "features": feats, "pose": pose}));
         return Ok(());

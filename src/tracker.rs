@@ -4,7 +4,7 @@
 use crate::gaze::NF;
 use crate::gestures::{classify, Pose, Swipe, SwipeDetector};
 use crate::now;
-use crate::vision::{FaceMesh, HandTracker, IrisModel, Rgb};
+use crate::vision::{FaceMesh, GazeNet, HandTracker, IrisModel, Rgb};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -18,6 +18,8 @@ pub struct Frame {
     pub pose: Option<Pose>,
     /// Raw face landmarks (478 x [x, y, z], iris centres refined) + [w, h]: saved with calibrations for offline tuning.
     pub raw: Option<Arc<Vec<f32>>>,
+    /// JPEG of the face box, only while recording (calibration): lets other gaze models be evaluated offline.
+    pub crop: Option<Arc<Vec<u8>>>,
 }
 
 #[derive(Default)]
@@ -35,6 +37,7 @@ pub struct Tracker {
     pub clicks: Receiver<(f64, f64, f64)>,
     pub use_hands: Arc<AtomicBool>,
     pub mirrored: Arc<AtomicBool>,
+    pub record: Arc<AtomicBool>,
 }
 
 // subject's right eye, then left eye: corners, upper/lower lid, iris centre
@@ -65,8 +68,9 @@ fn head_angles_3d(p: &[[f32; 3]]) -> (f32, f32) {
     (y[2].clamp(-1.0, 1.0).asin(), x[2].clamp(-1.0, 1.0).asin()) // (pitch, yaw)
 }
 
-/// 14 features: iris offsets + eyelid openness for both eyes, head pose (3D axes + 2D geometry), face position/scale.
-pub fn features(p: &[[f32; 3]], w: usize, h: usize) -> [f64; NF] {
+/// 16 features: iris offsets + eyelid openness for both eyes, head pose (3D axes + 2D geometry), face position/scale,
+/// and the gaze network's (yaw, pitch), which already combine eye and head rotation.
+pub fn features(p: &[[f32; 3]], w: usize, h: usize, net: (f32, f32)) -> [f64; NF] {
     let [rx, ry, ro] = eye_features(p, EYES[0]);
     let [lx, ly, lo] = eye_features(p, EYES[1]);
     let (e1, e2) = (p[33], p[263]);
@@ -86,6 +90,7 @@ pub fn features(p: &[[f32; 3]], w: usize, h: usize) -> [f64; NF] {
         pitch3 as f64, yaw3 as f64, roll as f64,
         cx as f64, cy as f64, (face_w / w as f32) as f64,
         yaw as f64, pitch as f64,
+        (net.0 / 30.0) as f64, (net.1 / 30.0) as f64,
     ]
 }
 
@@ -96,11 +101,19 @@ impl Tracker {
         let (click_tx, clicks) = unbounded();
         let use_hands = Arc::new(AtomicBool::new(true));
         let mirrored = Arc::new(AtomicBool::new(false));
-        let t = Tracker { shared: shared.clone(), swipes, clicks, use_hands: use_hands.clone(), mirrored: mirrored.clone() };
+        let record = Arc::new(AtomicBool::new(false));
+        let t = Tracker {
+            shared: shared.clone(),
+            swipes,
+            clicks,
+            use_hands: use_hands.clone(),
+            mirrored: mirrored.clone(),
+            record: record.clone(),
+        };
         std::thread::Builder::new()
             .name("tracker".into())
             .spawn(move || {
-                if let Err(e) = run(camera, &models, &shared, swipe_tx, use_hands, mirrored) {
+                if let Err(e) = run(camera, &models, &shared, swipe_tx, use_hands, mirrored, record) {
                     shared.lock().error = Some(format!("{e:#}"));
                 }
             })
@@ -113,8 +126,14 @@ impl Tracker {
         self.shared.lock().latest.clone()
     }
 
-    pub fn raw_between(&self, t0: f64, t1: f64) -> Vec<Arc<Vec<f32>>> {
-        self.shared.lock().history.iter().filter(|f| f.t >= t0 && f.t <= t1).filter_map(|f| f.raw.clone()).collect()
+    pub fn raw_between(&self, t0: f64, t1: f64) -> Vec<(Arc<Vec<f32>>, Option<Arc<Vec<u8>>>)> {
+        self.shared
+            .lock()
+            .history
+            .iter()
+            .filter(|f| f.t >= t0 && f.t <= t1)
+            .filter_map(|f| f.raw.clone().map(|r| (r, f.crop.clone())))
+            .collect()
     }
 
     pub fn features_between(&self, t0: f64, t1: f64) -> Vec<[f64; NF]> {
@@ -129,8 +148,11 @@ fn run(
     swipe_tx: Sender<(f64, Swipe)>,
     use_hands: Arc<AtomicBool>,
     mirrored: Arc<AtomicBool>,
+    record: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let mut face = FaceMesh::new(models)?;
+    let mut gaze_net = GazeNet::new(models).map_err(|e| eprintln!("gaze network unavailable ({e:#})")).ok();
+    let mut net = (0.0f32, 0.0f32);
     let mut iris = IrisModel::new(models).map_err(|e| eprintln!("iris model unavailable ({e:#}): using face-mesh iris")).ok();
     let mut hands: Option<HandTracker> = None;
     let cam = Cam::open(camera).map_err(|e| {
@@ -150,7 +172,16 @@ fn run(
             p[468][..2].copy_from_slice(&r);
             p[473][..2].copy_from_slice(&l);
         }
-        let feats = mesh.as_ref().map(|p| features(p, w, h));
+        // the gaze network and the hand model take turns, one per frame, to hold ~30 fps
+        let hands_turn = use_hands.load(Ordering::Relaxed) && n % 2 == 1;
+        if let (Some(p), Some(g), false) = (mesh.as_ref(), gaze_net.as_mut(), hands_turn) {
+            net = g.process(&rgb, p)?;
+        }
+        let feats = mesh.as_ref().map(|p| features(p, w, h, net));
+        let crop = match (&mesh, record.load(Ordering::Relaxed)) {
+            (Some(p), true) => face_jpeg(&img.data, w, h, p).map(Arc::new),
+            _ => None,
+        };
         let raw = mesh.map(|p| {
             let mut v: Vec<f32> = p.iter().flatten().copied().collect();
             v.extend([w as f32, h as f32]);
@@ -161,8 +192,7 @@ fn run(
             if hands.is_none() {
                 hands = Some(HandTracker::new(models)?);
             }
-            if n % 2 == 0 {
-                // hands every other frame: saves CPU
+            if n % 2 == 1 {
                 let lm = hands.as_mut().unwrap().process(&rgb)?;
                 let pts: Option<Vec<[f32; 2]>> = lm.map(|p| p.iter().map(|q| [q[0] / h as f32, q[1] / h as f32]).collect());
                 pose = pts.as_ref().map(|p| classify(p));
@@ -175,7 +205,7 @@ fn run(
             pose = None;
         }
 
-        let f = Frame { t, features: feats, pose, raw };
+        let f = Frame { t, features: feats, pose, raw, crop };
         {
             let mut s = shared.lock();
             s.history.push_back(f.clone());
@@ -192,6 +222,27 @@ fn run(
             t_fps = t;
         }
     }
+}
+
+/// JPEG (q90) of the face box, padded by 10%.
+fn face_jpeg(rgb: &[u8], w: usize, h: usize, mesh: &[[f32; 3]]) -> Option<Vec<u8>> {
+    let (bx, by, bw, bh) = crate::vision::face_box(mesh);
+    let (px, py) = (bw * 0.1, bh * 0.1);
+    let x0 = (bx - px).max(0.0) as usize;
+    let y0 = (by - py).max(0.0) as usize;
+    let x1 = ((bx + bw + px) as usize).min(w);
+    let y1 = ((by + bh + py) as usize).min(h);
+    if x1 <= x0 + 8 || y1 <= y0 + 8 {
+        return None;
+    }
+    let mut buf = Vec::with_capacity((x1 - x0) * (y1 - y0) * 3);
+    for y in y0..y1 {
+        buf.extend_from_slice(&rgb[(y * w + x0) * 3..(y * w + x1) * 3]);
+    }
+    let img = image::RgbImage::from_raw((x1 - x0) as u32, (y1 - y0) as u32, buf)?;
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90).encode_image(&img).ok()?;
+    Some(out)
 }
 
 #[cfg(target_os = "macos")]
@@ -226,26 +277,45 @@ impl Cam {
     }
 }
 
-/// Mouse-button polling (no global event tap needed). Needs Accessibility on macOS; silently idle without it.
+/// Mouse-button polling: every left click is a free calibration sample (people look at what they click).
+/// macOS: Quartz button state + cursor position, which need no Accessibility permission. Linux: device_query (X11).
 fn poll_clicks(tx: Sender<(f64, f64, f64)>) {
-    use device_query::DeviceQuery;
-    #[cfg(target_os = "macos")]
-    let state = loop {
-        if let Some(s) = device_query::DeviceState::checked_new() {
-            break s;
-        }
-        std::thread::sleep(std::time::Duration::from_secs(5)); // permission may be granted later
-    };
+    let mut was_down = false;
     #[cfg(not(target_os = "macos"))]
     let state = device_query::DeviceState::new();
-    let mut was_down = false;
     loop {
-        let m = state.get_mouse();
-        let down = m.button_pressed.get(1).copied().unwrap_or(false);
+        #[cfg(target_os = "macos")]
+        let (down, x, y) = mac_mouse();
+        #[cfg(not(target_os = "macos"))]
+        let (down, x, y) = {
+            use device_query::DeviceQuery;
+            let m = state.get_mouse();
+            (m.button_pressed.get(1).copied().unwrap_or(false), m.coords.0 as f64, m.coords.1 as f64)
+        };
         if down && !was_down {
-            let _ = tx.send((now(), m.coords.0 as f64, m.coords.1 as f64));
+            let _ = tx.send((now(), x, y));
         }
         was_down = down;
         std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_mouse() -> (bool, f64, f64) {
+    use core_graphics::event::CGEvent;
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventSourceButtonState(state: i32, button: u32) -> bool;
+    }
+    // kCGEventSourceStateCombinedSessionState = 0, kCGMouseButtonLeft = 0
+    let down = unsafe { CGEventSourceButtonState(0, 0) };
+    let pos = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+        .ok()
+        .and_then(|src| CGEvent::new(src).ok())
+        .map(|e| e.location());
+    match pos {
+        Some(p) => (down, p.x, p.y), // global, top-left origin, points
+        None => (false, 0.0, 0.0),
     }
 }

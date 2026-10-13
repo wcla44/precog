@@ -14,3 +14,6 @@ for m in face_detector face_landmarks_detector hand_detector hand_landmarks_dete
     python -m tf2onnx.convert --tflite build/tflite/$m.tflite --output models/onnx/$m.onnx --opset 17
 done
 ls -la models/onnx
+# appearance-based gaze network (MobileGaze, MIT): already ONNX
+[ -f models/onnx/mobileone_s0_gaze.onnx ] || curl -fL -o models/onnx/mobileone_s0_gaze.onnx \
+  https://github.com/yakhyo/gaze-estimation/releases/download/weights/mobileone_s0_gaze.onnx
