@@ -99,12 +99,17 @@ struct Detector {
 }
 
 impl Detector {
+    /// Detect in the whole frame (letterboxed), like MediaPipe.
     fn detect(&mut self, img: &Rgb) -> Result<Option<Detection>> {
-        // letterbox to a square (MediaPipe keeps the aspect ratio), half-pixel centres like cv2.resize
         let s = img.w.max(img.h) as f32;
-        let (ox, oy) = ((s - img.w as f32) / 2.0, (s - img.h as f32) / 2.0);
-        let k = s / self.size as f32;
-        let m = Affine([k, 0.0, 0.5 * k - 0.5 - ox, 0.0, k, 0.5 * k - 0.5 - oy]);
+        self.detect_in(img, -(s - img.w as f32) / 2.0, -(s - img.h as f32) / 2.0, s)
+    }
+
+    /// Detect inside the square [x0, x0+side] x [y0, y0+side] (image pixels, may extend past the borders).
+    fn detect_in(&mut self, img: &Rgb, x0: f32, y0: f32, side: f32) -> Result<Option<Detection>> {
+        // half-pixel centres like cv2.resize
+        let k = side / self.size as f32;
+        let m = Affine([k, 0.0, 0.5 * k - 0.5 + x0, 0.0, k, 0.5 * k - 0.5 + y0]);
         let signed = self.signed;
         let data = warp(img, m, self.size, |p| if signed { p / 127.5 - 1.0 } else { p / 255.0 });
         let tensor = Tensor::from_array(([1usize, self.size, self.size, 3], data))?;
@@ -124,12 +129,29 @@ impl Detector {
         let r = &reg[best * stride..(best + 1) * stride];
         let sz = self.size as f32;
         let a = self.anchors[best];
-        let to_img = |px: f32, py: f32| (px * s - ox, py * s - oy);
+        let to_img = |px: f32, py: f32| (px * side + x0, py * side + y0);
         let center = to_img(r[0] / sz + a.0, r[1] / sz + a.1);
         let keypoints = (0..self.keypoints)
             .map(|i| to_img(r[4 + 2 * i] / sz + a.0, r[5 + 2 * i] / sz + a.1))
             .collect();
-        Ok(Some(Detection { score, center, size: (r[2] / sz * s, r[3] / sz * s), keypoints }))
+        Ok(Some(Detection { score, center, size: (r[2] / sz * side, r[3] / sz * side), keypoints }))
+    }
+
+    /// Whole frame first; if nothing, zoom on central squares. The short-range face model needs the face to be
+    /// ~25+ px in its 128 px input, i.e. a face under ~250 px wide in a 1280 px frame is often missed otherwise.
+    fn detect_multiscale(&mut self, img: &Rgb) -> Result<Option<Detection>> {
+        if let Some(d) = self.detect(img)? {
+            return Ok(Some(d));
+        }
+        let (w, h) = (img.w as f32, img.h as f32);
+        let m = w.min(h);
+        for (frac, cy) in [(1.0, 0.5), (0.6, 0.45), (0.6, 0.3)] {
+            let side = m * frac;
+            if let Some(d) = self.detect_in(img, (w - side) / 2.0, h * cy - side / 2.0, side)? {
+                return Ok(Some(d));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -152,21 +174,41 @@ impl Roi {
     }
 }
 
-fn session(dir: &Path, name: &str) -> Result<Session> {
+/// Session for any model file, plain CPU (see `session`), with its own thread count.
+pub fn session_with_threads(path: &Path, threads: usize) -> Result<Session> {
+    let env = env()?;
+    let mut b = Session::builder(env)?
+        .with_auto_device(ort::session::builder::AutoDevicePolicy::PreferCPU)
+        .and_then(|b| b.with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3))
+        .and_then(|b| b.with_intra_threads(threads))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(b.commit_from_file(path)?)
+}
+
+fn env() -> Result<&'static ort::environment::Environment> {
     static ENV: std::sync::OnceLock<ort::environment::Environment> = std::sync::OnceLock::new();
-    let env = match ENV.get() {
+    Ok(match ENV.get() {
         Some(e) => e,
         None => {
             let e = ort::init().with_name("precog").build().map_err(|e| anyhow::anyhow!("onnxruntime: {e}"))?;
             ENV.get_or_init(|| e)
         }
-    };
+    })
+}
+
+fn session(dir: &Path, name: &str) -> Result<Session> {
+    let env = env()?;
     let path = dir.join(name);
-    Session::builder(env)?
-        .with_intra_threads(2)
-        .map_err(|e| anyhow::anyhow!("{e}"))?
-        .commit_from_file(&path)
-        .with_context(|| format!("loading {} (run scripts/convert_models.sh)", path.display()))
+    let threads = std::env::var("PRECOG_ORT_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    // ort defaults to an "efficiency" device policy, which on Apple silicon is ~9x slower for these small
+    // models (21 ms vs 2.4 ms for the face mesh): force the plain CPU path.
+    let b = Session::builder(env)?
+        .with_auto_device(ort::session::builder::AutoDevicePolicy::PreferCPU)
+        .and_then(|b| b.with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3))
+        .and_then(|b| b.with_intra_threads(threads))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut b = b;
+    b.commit_from_file(&path).with_context(|| format!("loading {} (run scripts/convert_models.sh)", path.display()))
 }
 
 fn input_name(s: &Session) -> String {
@@ -204,7 +246,7 @@ impl FaceMesh {
         let roi = match self.roi {
             Some(r) => r,
             None => {
-                let Some(d) = self.detector.detect(img)? else { return Ok(None) };
+                let Some(d) = self.detector.detect_multiscale(img)? else { return Ok(None) };
                 let _ = d.score;
                 let (r, l) = (d.keypoints[0], d.keypoints[1]); // right eye -> left eye, target angle 0
                 let angle = norm_angle(-(-(l.1 - r.1)).atan2(l.0 - r.0));
@@ -317,4 +359,64 @@ impl HandTracker {
         self.roi = Some(roi_from_points(&pts, pts[0], pts[9], PI / 2.0, 2.0, -0.1));
         Ok(Some(pts))
     }
+}
+
+/// MediaPipe iris model: 64x64 crop per eye -> refined iris centre (5 iris points + 71 eye-contour points).
+/// More precise than the face mesh's own iris points, which come from a 256x256 crop of the whole face.
+/// Pre-processing found empirically against the face mesh: input [0, 1], the subject's right eye is mirrored.
+pub struct IrisModel {
+    session: Session,
+    input: String,
+}
+
+/// (corner 1, corner 2, mirror?) for the subject's right eye, then left eye.
+const IRIS_EYES: [(usize, usize, bool); 2] = [(33, 133, true), (362, 263, false)];
+
+impl IrisModel {
+    pub fn new(dir: &Path) -> Result<Self> {
+        let s = session(dir, "iris_landmark.onnx")?;
+        Ok(Self { input: input_name(&s), session: s })
+    }
+
+    /// Refined iris centres (right eye, left eye) in image pixels, from face-mesh eye corners.
+    pub fn process(&mut self, img: &Rgb, mesh: &[[f32; 3]]) -> Result<[[f32; 2]; 2]> {
+        let mut out = [[0.0; 2]; 2];
+        for (k, &(c1, c2, mirror)) in IRIS_EYES.iter().enumerate() {
+            let (a, b) = (mesh[c1], mesh[c2]);
+            let angle = norm_angle(-(-(b[1] - a[1])).atan2(b[0] - a[0]));
+            let side = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt() * 2.3;
+            let roi = Roi { cx: (a[0] + b[0]) / 2.0, cy: (a[1] + b[1]) / 2.0, side, angle };
+            let m = roi.affine(64);
+            // mirrored crop: pixel u of the input is pixel 63-u of the crop
+            let mf = if mirror {
+                let p = m.0;
+                Affine([-p[0], p[1], p[0] * 63.0 + p[2], -p[3], p[4], p[3] * 63.0 + p[5]])
+            } else {
+                m
+            };
+            let data = warp(img, mf, 64, |p| p / 255.0);
+            let tensor = Tensor::from_array(([1usize, 64, 64, 3], data))?;
+            let outputs = self.session.run(ort::inputs![self.input.as_str() => tensor])?;
+            let (_, iris) = outputs[1].try_extract_tensor::<f32>()?;
+            let (mut x, y) = (iris[0], iris[1]); // centre of the iris
+            if mirror {
+                x = 64.0 - x;
+            }
+            let (ix, iy) = m.apply(x, y);
+            out[k] = [ix, iy];
+        }
+        Ok(out)
+    }
+}
+
+/// Tight face box from the mesh: (x0, y0, w, h).
+pub fn face_box(mesh: &[[f32; 3]]) -> (f32, f32, f32, f32) {
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for p in &mesh[..468] {
+        x0 = x0.min(p[0]);
+        y0 = y0.min(p[1]);
+        x1 = x1.max(p[0]);
+        y1 = y1.max(p[1]);
+    }
+    (x0, y0, x1 - x0, y1 - y0)
 }

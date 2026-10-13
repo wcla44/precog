@@ -2,6 +2,7 @@
 
 mod actions;
 mod agent;
+mod cloud;
 #[cfg(target_os = "macos")]
 mod camera_mac;
 mod dictation;
@@ -13,6 +14,7 @@ mod paths;
 mod settings;
 mod tracker;
 mod tray;
+mod unigaze;
 mod ui;
 mod vision;
 
@@ -56,11 +58,74 @@ struct Args {
     /// Debug: run face + hand models on an image and print landmarks as JSON
     #[arg(long, hide = true)]
     dump_landmarks: Option<std::path::PathBuf>,
+    /// Debug: time each vision stage on an image
+    #[arg(long, hide = true)]
+    bench: Option<std::path::PathBuf>,
+    /// Debug: UniGaze on an image: print (pitch, yaw), write the normalised face next to it
+    #[arg(long, hide = true)]
+    unigaze: Option<std::path::PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
     now();
     let args = Args::parse();
+    if let Some(path) = &args.unigaze {
+        let img = image::open(path)?.to_rgb8();
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let rgb = vision::Rgb { w, h, data: img.as_raw() };
+        let dir = paths::onnx_dir();
+        let mesh = vision::FaceMesh::new(&dir)?.process(&rgb)?.ok_or_else(|| anyhow::anyhow!("no face"))?;
+        let chw = unigaze::normalize(&rgb, &mesh).ok_or_else(|| anyhow::anyhow!("normalisation failed"))?;
+        let n = unigaze::SIZE * unigaze::SIZE;
+        let (mean, std) = ([0.485f32, 0.456, 0.406], [0.229f32, 0.224, 0.225]);
+        let out = image::RgbImage::from_fn(unigaze::SIZE as u32, unigaze::SIZE as u32, |x, y| {
+            let i = y as usize * unigaze::SIZE + x as usize;
+            image::Rgb([0, 1, 2].map(|c| ((chw[c * n + i] * std[c] + mean[c]) * 255.0).clamp(0.0, 255.0) as u8))
+        });
+        out.save(path.with_extension("norm.png"))?;
+        let mut ug = unigaze::UniGaze::new(&dir, 4)?;
+        let t0 = now();
+        let (p, y) = ug.run(chw.clone())?;
+        let dt = now() - t0;
+        let t1 = now();
+        for _ in 0..5 {
+            ug.run(chw.clone())?;
+        }
+        println!("pitch {p:.4} yaw {y:.4} rad  (first {:.0} ms, then {:.0} ms/frame)", dt * 1000.0, (now() - t1) * 200.0);
+        let mesh_json: Vec<[f32; 3]> = mesh;
+        std::fs::write(path.with_extension("mesh.json"), serde_json::to_vec(&mesh_json)?)?;
+        return Ok(());
+    }
+    if let Some(path) = &args.bench {
+        let img = image::open(path)?.to_rgb8();
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let rgb = vision::Rgb { w, h, data: img.as_raw() };
+        let dir = paths::onnx_dir();
+        let (mut face, mut iris, mut hand) = (vision::FaceMesh::new(&dir)?, vision::IrisModel::new(&dir)?, vision::HandTracker::new(&dir)?);
+        let p = face.process(&rgb)?.expect("no face");
+        let n = 50;
+        let time = |name: &str, f: &mut dyn FnMut()| {
+            let t0 = now();
+            for _ in 0..n {
+                f();
+            }
+            println!("{name:>14}: {:6.2} ms", (now() - t0) * 1000.0 / n as f64);
+        };
+        time("face (tracked)", &mut || {
+            face.process(&rgb).unwrap();
+        });
+        time("iris (2 eyes)", &mut || {
+            iris.process(&rgb, &p).unwrap();
+        });
+        time("hand", &mut || {
+            hand.process(&rgb).unwrap();
+        });
+        time("hand (reset)", &mut || {
+            hand = vision::HandTracker::new(&dir).unwrap();
+            hand.process(&rgb).unwrap();
+        });
+        return Ok(());
+    }
     if let Some(path) = &args.dump_landmarks {
         let img = image::open(path)?.to_rgb8();
         let (w, h) = (img.width() as usize, img.height() as usize);
@@ -68,9 +133,13 @@ fn main() -> anyhow::Result<()> {
         let dir = paths::onnx_dir();
         let face = vision::FaceMesh::new(&dir)?.process(&rgb)?;
         let hand = vision::HandTracker::new(&dir)?.process(&rgb)?;
+        let iris = match &face {
+            Some(p) => Some(vision::IrisModel::new(&dir)?.process(&rgb, p)?),
+            None => None,
+        };
         let feats = face.as_ref().map(|p| tracker::features(p, w, h).to_vec());
         let pose = hand.as_ref().map(|p| format!("{:?}", gestures::classify(&p.iter().map(|q| [q[0], q[1]]).collect::<Vec<_>>())));
-        println!("{}", serde_json::json!({"face": face, "hand": hand, "features": feats, "pose": pose}));
+        println!("{}", serde_json::json!({"face": face, "hand": hand, "iris": iris, "features": feats, "pose": pose}));
         return Ok(());
     }
     if args.test_llm {

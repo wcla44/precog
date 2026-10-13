@@ -3,17 +3,17 @@
 
 use crate::actions::{self, Action};
 use crate::agent::Agent;
+use crate::cloud::{self, Smudge};
 use crate::dictation::{self, Dictation};
-use crate::gaze::{GazeModel, OneEuro, CLICK_GROUP, NF};
+use crate::gaze::{ClickCorrector, GazeKalman, GazeModel, CLICK_GROUP, FEATURE_VERSION, NF};
 use crate::gestures::{Debounce, Pose, Swipe};
 use crate::monitors::{self, Monitor};
 use crate::settings::Settings;
 use crate::tracker::Tracker;
 use crate::tray::{self, Tray};
 use crate::{llm, now, paths};
-use egui::{Align2, Color32, CornerRadius, FontId, Frame, Margin, Pos2, Stroke, ViewportBuilder, ViewportCommand, ViewportId};
+use egui::{Align2, Color32, CornerRadius, FontId, Frame, Margin, Pos2, ViewportBuilder, ViewportCommand, ViewportId};
 use parking_lot::Mutex;
-use rand::seq::SliceRandom;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,31 +30,35 @@ struct Calibration {
     t0: f64,
     settle: f64,
     model: GazeModel,
+    umodel: GazeModel,
+    /// Raw landmarks per dot, saved for offline tuning of features / models.
+    raw: Vec<serde_json::Value>,
+    /// Dots already re-queued once because the face was not seen.
+    retried: std::collections::HashSet<(usize, i64, i64)>,
 }
 
 impl Calibration {
-    const GRID: usize = 4;
-    const SETTLE: f64 = 0.7;
-    const SWITCH_SETTLE: f64 = 1.4;
-    const COLLECT: f64 = 1.0;
+    // short on purpose: clicks keep refining the model afterwards
+    const SETTLE: f64 = 0.45;
+    const SWITCH_SETTLE: f64 = 1.0;
+    const COLLECT: f64 = 0.65;
 
     fn new(mons: &[Monitor]) -> Self {
-        let mut rng = rand::rng();
         let mut points = Vec::new();
         for (mi, m) in mons.iter().enumerate() {
-            let mut pts: Vec<(usize, f64, f64)> = (0..Self::GRID * Self::GRID)
-                .map(|k| {
-                    let fx = 0.05 + 0.9 * (k % Self::GRID) as f64 / (Self::GRID - 1) as f64;
-                    let fy = 0.05 + 0.9 * (k / Self::GRID) as f64 / (Self::GRID - 1) as f64;
-                    (mi, m.left as f64 + fx * m.width as f64, m.top as f64 + fy * m.height as f64)
-                })
-                .collect();
-            pts.shuffle(&mut rng);
+            // 3x3 per screen in a snake path: predictable, so the eyes get there fast
+            let pts = (0..9).map(|k| {
+                let (row, col) = (k / 3, if (k / 3) % 2 == 0 { k % 3 } else { 2 - k % 3 });
+                let (fx, fy) = (0.04 + 0.46 * col as f64, 0.04 + 0.46 * row as f64); // close to the edges
+                (mi, m.left as f64 + fx * m.width as f64, m.top as f64 + fy * m.height as f64)
+            });
             points.extend(pts);
         }
-        let mut model = GazeModel::default();
+        let mut model = GazeModel::landmarks();
         model.layout = mons.iter().map(|m| m.layout()).collect();
-        Self { points, i: None, t0: 0.0, settle: Self::SWITCH_SETTLE, model }
+        let mut umodel = GazeModel::unigaze();
+        umodel.layout = model.layout.clone();
+        Self { points, i: None, t0: 0.0, settle: Self::SWITCH_SETTLE, model, umodel, raw: Vec::new(), retried: Default::default() }
     }
 
     fn start_point(&mut self, i: usize, t: f64) {
@@ -70,11 +74,23 @@ impl Calibration {
         if t - self.t0 < self.settle + Self::COLLECT {
             return false;
         }
-        let feats = tracker.features_between(self.t0 + self.settle, self.t0 + self.settle + Self::COLLECT);
+        let (t0, t1) = (self.t0 + self.settle, self.t0 + self.settle + Self::COLLECT);
+        let feats = tracker.features_between(t0, t1);
+        let (mi, x, y) = self.points[i];
         if feats.len() >= 5 {
-            let (_, x, y) = self.points[i];
             self.model.add(&feats, [x, y], i as i64, 1.0);
+            let ug: Vec<[f64; 2]> = tracker.ug_between(t0, t1).iter().map(|u| u.angles).collect();
+            self.umodel.add(&ug, [x, y], i as i64, 1.0);
+        } else if self.retried.insert((mi, x as i64, y as i64)) {
+            self.points.push((mi, x, y)); // face not seen: try this dot again at the end
         }
+        let frames = tracker.raw_between(t0, t1);
+        use base64::Engine;
+        self.raw.push(serde_json::json!({
+            "monitor": mi, "target": [x, y],
+            "frames": frames.iter().map(|f| f.0.as_slice().to_vec()).collect::<Vec<_>>(),
+            "crops": frames.iter().map(|f| f.1.as_ref().map(|j| base64::engine::general_purpose::STANDARD.encode(j.as_slice()))).collect::<Vec<_>>(),
+        }));
         if i + 1 >= self.points.len() {
             return true;
         }
@@ -214,7 +230,9 @@ pub struct PrecogApp {
     monitors: Vec<Monitor>,
     tracker: Tracker,
     model: Option<GazeModel>,
-    filter: OneEuro,
+    /// UniGaze angles -> screen; fused with the landmark model (see `fused`).
+    umodel: Option<GazeModel>,
+    filter: GazeKalman,
     gaze: Option<(f64, f64)>,
     face: bool,
     agent: Agent,
@@ -232,7 +250,10 @@ pub struct PrecogApp {
     tray: Option<Tray>,
     tray_status: String,
     show_settings: bool,
-    mouse: Option<enigo::Enigo>,
+    smudge: Smudge,
+    corrector: ClickCorrector<GazeInput>,
+    /// Gaze error measured at each click, before learning from it: the real-world accuracy.
+    click_errs: std::collections::VecDeque<f64>,
     last: f64,
     custom_model: String,
 }
@@ -254,9 +275,12 @@ impl PrecogApp {
         let monitors = monitors::list();
         let tracker = Tracker::start(opts.camera, paths::onnx_dir());
         let mut model = None;
+        let mut umodel = None;
         let path = paths::gaze_model();
         if path.exists() && !opts.calibrate {
+            umodel = GazeModel::load(&paths::gaze_model_unigaze()).ok();
             match GazeModel::load(&path) {
+                Ok(m) if m.version != FEATURE_VERSION => println!("gaze features changed since last calibration: recalibrating"),
                 Ok(m) if m.layout == monitors.iter().map(|m| m.layout()).collect::<Vec<_>>() => model = Some(m),
                 Ok(_) => println!("screen layout changed since last calibration: recalibrating"),
                 Err(e) => println!("could not load gaze model ({e:#}): recalibrating"),
@@ -267,17 +291,17 @@ impl PrecogApp {
         } else {
             Tray::new(&cfg).map_err(|e| println!("tray icon unavailable: {e:#}")).ok()
         };
-        let mouse = actions::enigo().ok();
         let want_calibration = model.is_none();
         let mut app = Self {
             agent: Agent::new(monitors.clone()),
+            umodel: if model.is_some() { umodel } else { None },
             saved,
             custom_model: cfg.model.clone(),
             cfg,
             monitors,
             tracker,
             model,
-            filter: OneEuro::new(),
+            filter: GazeKalman::new(100.0),
             gaze: None,
             face: false,
             popup: None,
@@ -294,10 +318,15 @@ impl PrecogApp {
             tray,
             tray_status: String::new(),
             show_settings: false,
-            mouse,
+            smudge: Smudge::new(),
+            corrector: ClickCorrector::new(),
+            click_errs: Default::default(),
             last: now(),
         };
         app.apply();
+        if let Some(m) = &app.model {
+            app.filter = GazeKalman::new(m.cv_error() * 0.5);
+        }
         if app.cfg.gesture && app.cfg.voice {
             app.dictation.preload();
         }
@@ -350,16 +379,22 @@ impl PrecogApp {
         self.face = f.as_ref().is_some_and(|f| f.features.is_some() && t - f.t < 0.3);
         match (&f, &self.model) {
             (Some(fr), Some(m)) if self.face && self.calib.is_none() => {
-                if let Some((x, y)) = m.predict(fr.features.as_ref().unwrap()) {
-                    let (x, y) = monitors::clamp(&self.monitors, x, y);
-                    let p = self.filter.filter([x, y], t);
+                let ug = self.tracker.ug_latest().filter(|u| t - u.t < 1.0).and_then(|u| Some((u.angles, u.land?)));
+                let input = GazeInput { land: fr.features.unwrap(), ug };
+                if let Some((x, y)) = fused(m, self.umodel.as_ref(), &input) {
+                    let c = self.corrector.correction([x, y], t);
+                    let (x, y) = monitors::clamp(&self.monitors, x + c[0], y + c[1]);
+                    let p = self.filter.update([x, y], t);
                     self.gaze = Some((p[0], p[1]));
                 }
             }
-            _ if !self.face => self.gaze = None,
+            _ if !self.face => {
+                self.gaze = None;
+                self.filter.reset();
+            }
             _ => {}
         }
-
+        self.smudge.set_noise(self.filter.jitter(), dt);
         self.learn_from_clicks();
         self.handle_tray(ctx);
 
@@ -367,6 +402,7 @@ impl PrecogApp {
             self.want_calibration = false;
             self.calib = Some(Calibration::new(&self.monitors));
         }
+        self.tracker.record.store(self.calib.is_some(), Ordering::Relaxed);
         if let Some(c) = &mut self.calib {
             if c.update(t, &self.tracker) {
                 self.finish_calibration(false);
@@ -452,24 +488,46 @@ impl PrecogApp {
             println!("calibration cancelled/failed (is your face visible?)");
             return;
         }
+        let raw_path = paths::data_dir().join("calibrations").join(format!(
+            "{}.json",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+        ));
+        let _ = std::fs::create_dir_all(raw_path.parent().unwrap());
+        let _ = std::fs::write(&raw_path, serde_json::to_vec(&serde_json::json!({ "layout": c.model.layout, "points": c.raw })).unwrap_or_default());
         match c.model.fit() {
             Ok(err) => {
                 let _ = c.model.save(&paths::gaze_model());
+                self.filter = GazeKalman::new(err * 0.5);
                 println!(
                     "calibrated on {} screen(s): {} samples, cross-validated median error {err:.0}px",
                     self.monitors.len(),
                     c.model.len()
                 );
                 self.model = Some(c.model);
+                self.umodel = match c.umodel.fit() {
+                    Ok(e) => {
+                        println!("UniGaze: {} samples, cross-validated median error {e:.0}px", c.umodel.len());
+                        let _ = c.umodel.save(&paths::gaze_model_unigaze());
+                        Some(c.umodel)
+                    }
+                    Err(e) => {
+                        println!("UniGaze not calibrated ({e:#}): landmarks only");
+                        None
+                    }
+                };
                 self.n_clicks = 0;
+                self.corrector = ClickCorrector::new();
+                self.click_errs.clear();
             }
             Err(e) => println!("calibration failed: {e:#}"),
         }
     }
 
-    /// Implicit calibration: people look at what they click ~100-300 ms before the click.
+    /// Continuous recalibration: people look at what they click ~100-300 ms before the click. Each click is
+    /// scored first (real-world accuracy), skipped if the user clearly wasn't looking, then learned by both models
+    /// (refit) and by the local corrector. Silent, no UI.
     fn learn_from_clicks(&mut self) {
-        let mut refit = false;
+        let mut learned = false;
         while let Ok((t, x, y)) = self.tracker.clicks.try_recv() {
             if !self.cfg.learn || self.calib.is_some() || self.popup.is_some() {
                 continue;
@@ -479,14 +537,52 @@ impl PrecogApp {
             if feats.len() < 3 {
                 continue;
             }
-            m.add(&feats, [x, y], CLICK_GROUP + self.n_clicks as i64, 0.5);
+            let mut mean = [0.0; NF];
+            for f in &feats {
+                for i in 0..NF {
+                    mean[i] += f[i] / feats.len() as f64;
+                }
+            }
+            // UniGaze runs at ~10 Hz: take its results from a slightly wider window before the click
+            let ugs = self.tracker.ug_between(t - 0.6, t - 0.02);
+            let ug = ugs.iter().rev().find_map(|u| Some((u.angles, u.land?)));
+            let input = GazeInput { land: mean, ug };
+            if let Some((px, py)) = fused(m, self.umodel.as_ref(), &input) {
+                let c = self.corrector.correction([px, py], t);
+                let err = ((px + c[0] - x).powi(2) + (py + c[1] - y).powi(2)).sqrt();
+                let med = median(&self.click_errs);
+                if self.click_errs.len() >= 5 && err > (3.0 * med).max(700.0) {
+                    continue; // looking elsewhere while clicking: not a valid label
+                }
+                self.click_errs.push_back(err);
+                while self.click_errs.len() > 30 {
+                    self.click_errs.pop_front();
+                }
+            }
+            m.add(&feats, [x, y], CLICK_GROUP + self.n_clicks as i64, 1.0);
+            if let Some(um) = &mut self.umodel {
+                let angles: Vec<[f64; 2]> = ugs.iter().map(|u| u.angles).collect();
+                um.add(&angles, [x, y], CLICK_GROUP + self.n_clicks as i64, 1.0);
+            }
+            self.corrector.add(t, [x, y], input);
             self.n_clicks += 1;
-            refit |= self.n_clicks % 5 == 0;
+            learned = true;
         }
-        if refit {
+        if learned {
             if let Some(m) = &mut self.model {
-                if m.fit().is_ok() {
+                let _ = m.refit();
+            }
+            if let Some(um) = &mut self.umodel {
+                let _ = um.refit();
+            }
+            if let Some(m) = &self.model {
+                let um = self.umodel.as_ref();
+                self.corrector.update_residuals(|inp| fused(m, um, inp));
+                if self.n_clicks % 10 == 0 {
                     let _ = m.save(&paths::gaze_model());
+                    if let Some(um) = um {
+                        let _ = um.save(&paths::gaze_model_unigaze());
+                    }
                 }
             }
         }
@@ -558,8 +654,14 @@ impl PrecogApp {
         if self.cfg.gesture {
             parts.push(Pose::icon(self.pose).into());
         }
-        if let Some(m) = &self.model {
-            parts.push(format!("err~{:.0}px clicks:{}", m.cv_error(), self.n_clicks));
+        let ug = self.tracker.ug_rate();
+        if ug > 0.0 {
+            parts.push(format!("unigaze {ug:.0}Hz{}", if self.umodel.is_some() { "" } else { " (uncalibrated)" }));
+        }
+        if !self.click_errs.is_empty() {
+            parts.push(format!("click err~{:.0}px ({} clicks)", median(&self.click_errs), self.n_clicks));
+        } else if let Some(m) = &self.model {
+            parts.push(format!("calib err~{:.0}px", m.cv_error()));
         }
         if self.dictation.state() != dictation::State::Idle {
             parts.push(format!("🎙 {:?}", self.dictation.state()).to_lowercase());
@@ -584,25 +686,26 @@ impl PrecogApp {
         }
     }
 
-    fn gaze_ring(&mut self, ctx: &egui::Context) {
+    fn gaze_cloud(&mut self, ctx: &egui::Context) {
         let Some((x, y)) = self.gaze else { return };
         if !self.cfg.dot || self.calib.is_some() {
             return;
         }
-        // never sit under the cursor (would eat clicks)
-        let near = self
-            .mouse
-            .as_ref()
-            .and_then(|m| enigo::Mouse::location(m).ok())
-            .is_some_and(|(mx, my)| (x - mx as f64).powi(2) + (y - my as f64).powi(2) < 80.0f64.powi(2));
-        let s = 44.0;
+        let s = cloud::SIZE;
+        // Keep the window inside the monitor (macOS pushes windows that stick out above the screen back down,
+        // which made the smudge stop short of the top) and draw the smudge offset inside it instead.
+        let m = monitors::at(&self.monitors, x, y);
+        let wx = (x as f32 - s / 2.0).clamp(m.left as f32, (m.right() as f32 - s).max(m.left as f32));
+        let wy = (y as f32 - s / 2.0).clamp(m.top as f32, (m.bottom() as f32 - s).max(m.top as f32));
+        let local = Pos2::new(x as f32 - wx, y as f32 - wy);
+        let smudge = &mut self.smudge;
+        // click-through, so it never needs to dodge the cursor
         ctx.show_viewport_immediate(
             ViewportId::from_hash_of("gaze"),
-            overlay("precog gaze", [s, s], [x as f32 - s / 2.0, y as f32 - s / 2.0]).with_mouse_passthrough(true).with_visible(!near),
+            overlay("precog gaze", [s, s], [wx, wy]).with_mouse_passthrough(true),
             |ui, _| {
-                egui::CentralPanel::no_frame().show(ui, |ui| {
-                    ui.painter().circle_stroke(Pos2::new(s / 2.0, s / 2.0), s / 2.0 - 4.0, Stroke::new(4.0, RED));
-                });
+                let ctx = ui.ctx().clone();
+                egui::CentralPanel::no_frame().show(ui, |ui| smudge.paint(&ctx, ui.painter(), local, now()));
             },
         );
     }
@@ -611,6 +714,7 @@ impl PrecogApp {
         let Some(c) = &self.calib else { return };
         let (cur, t0, settle) = (c.i.map(|i| (i, c.points[i])), c.t0, c.settle);
         let total = c.points.len();
+        let face = self.face;
         let mut start = false;
         let mut abort = false;
         for (mi, m) in self.monitors.iter().enumerate() {
@@ -631,7 +735,7 @@ impl PrecogApp {
                                 Pos2::new(size.x / 2.0, size.y / 2.0),
                                 Align2::CENTER_CENTER,
                                 format!(
-                                    "Calibration · {} screen(s)\n\nFollow each dot with your EYES. Turn your head naturally when it changes screen.\nSit the way you usually work.\n\nCLICK anywhere to start · ESC to cancel",
+                                    "Calibration · {} screen(s)\n\nKeep your eyes on each dot, and while you do, gently move your head a little\n(left/right, up/down, closer/further): it teaches precog to handle head movement.\nSit the way you usually work.\n\nCLICK anywhere to start · ESC to cancel",
                                     self.monitors.len()
                                 ),
                                 FontId::proportional(26.0),
@@ -644,7 +748,10 @@ impl PrecogApp {
                             let c = Pos2::new((x - m.left as f64) as f32, (y - m.top as f64) as f32);
                             p.circle_filled(c, r, RED);
                             p.circle_filled(c, 2.0, Color32::WHITE);
-                            p.text(Pos2::new(size.x / 2.0, 30.0), Align2::CENTER_CENTER, format!("{}/{total}", i + 1), FontId::proportional(14.0), Color32::GRAY);
+                            p.text(Pos2::new(size.x / 2.0, 30.0), Align2::CENTER_CENTER, format!("{}/{total} · eyes on the dot, move your head gently", i + 1), FontId::proportional(14.0), Color32::GRAY);
+                            if !face {
+                                p.text(Pos2::new(size.x / 2.0, 60.0), Align2::CENTER_CENTER, "⚠ face not detected: face the camera, add light", FontId::proportional(18.0), Color32::from_rgb(255, 180, 0));
+                            }
                         }
                         _ => {}
                     }
@@ -752,6 +859,48 @@ impl PrecogApp {
     }
 }
 
+/// What the gaze estimate is computed from (also stored per click, to recompute residuals after refits).
+#[derive(Clone)]
+struct GazeInput {
+    /// Landmark features now.
+    land: [f64; NF],
+    /// Latest UniGaze result: (angles, landmark features of the frame it was computed on).
+    ug: Option<([f64; 2], [f64; NF])>,
+}
+
+/// UniGaze gives the accurate absolute position (~10 Hz); the landmark model adds how far the gaze moved since
+/// that frame, so the estimate keeps the 30 fps responsiveness (saccades) of the landmarks.
+fn fused(land: &GazeModel, uni: Option<&GazeModel>, inp: &GazeInput) -> Option<(f64, f64)> {
+    let (lx, ly) = land.predict(&inp.land)?;
+    if let (Some(um), Some((angles, land_then))) = (uni.filter(|u| u.ready()), &inp.ug) {
+        if let (Some((ux, uy)), Some((tx, ty))) = (um.predict(angles), land.predict(land_then)) {
+            // The landmark model is unreliable while the head moves (the eyes counter-rotate to keep the gaze
+            // fixed, which it reads as gaze motion). Use its motion only while the head is still; otherwise trust
+            // UniGaze alone, which models head pose.
+            let w = head_still(&inp.land, land_then);
+            return Some((ux + w * (lx - tx), uy + w * (ly - ty)));
+        }
+    }
+    Some((lx, ly))
+}
+
+/// 1 when the head pose is the same in both frames, falling to 0 as it rotates (~2 deg) or moves (~1.5% of the
+/// image). Feature layout: see `tracker::features` (6 pitch, 7 yaw, 8 roll, 9-10 face centre, 11 face scale).
+fn head_still(a: &[f64; NF], b: &[f64; NF]) -> f64 {
+    let rot = ((a[6] - b[6]).powi(2) + (a[7] - b[7]).powi(2) + (a[8] - b[8]).powi(2)).sqrt() / 0.035;
+    let pos = ((a[9] - b[9]).powi(2) + (a[10] - b[10]).powi(2)).sqrt() / 0.015 + (a[11] - b[11]).abs() / 0.01;
+    (-(rot * rot + pos * pos)).exp()
+}
+
+fn median(v: &std::collections::VecDeque<f64>) -> f64 {
+    if v.is_empty() {
+        return f64::NAN;
+    }
+    let mut s: Vec<f64> = v.iter().copied().collect();
+    s.sort_by(f64::total_cmp);
+    s[s.len() / 2]
+}
+
 fn overlay(title: &str, size: [f32; 2], pos: [f32; 2]) -> ViewportBuilder {
     ViewportBuilder::default()
         .with_title(title)
@@ -769,7 +918,7 @@ fn overlay(title: &str, size: [f32; 2], pos: [f32; 2]) -> ViewportBuilder {
 fn settings_form(ui: &mut egui::Ui, c: &mut Settings, custom_model: &mut String, recalibrate: &mut bool) {
     ui.heading("General");
     ui.checkbox(&mut c.agent, "Suggestions (LLM looks at the screen when your gaze settles)");
-    ui.checkbox(&mut c.dot, "Show gaze ring");
+    ui.checkbox(&mut c.dot, "Show gaze cloud");
     ui.checkbox(&mut c.learn, "Learn from my clicks (improves gaze accuracy over time)");
     ui.add(egui::Slider::new(&mut c.dwell, 1.0..=4.0).text("fixation before asking (s)"));
     ui.add(egui::Slider::new(&mut c.interval, 5.0..=120.0).logarithmic(true).text("min time between asks (s)"));
@@ -852,6 +1001,25 @@ fn settings_form(ui: &mut egui::Ui, c: &mut Settings, custom_model: &mut String,
     ui.label(egui::RichText::new(format!("Saved to {} (mode 600)", crate::settings::path().display())).small().color(Color32::GRAY));
 }
 
+impl Drop for PrecogApp {
+    fn drop(&mut self) {
+        if let Some(m) = &self.model {
+            let _ = m.save(&paths::gaze_model()); // keep what the clicks taught
+        }
+        if let Some(um) = &self.umodel {
+            let _ = um.save(&paths::gaze_model_unigaze());
+        }
+        if self.n_clicks > 0 {
+            println!(
+                "session: learned from {} clicks, median gaze error at the last {} clicks: {:.0}px",
+                self.n_clicks,
+                self.click_errs.len(),
+                median(&self.click_errs)
+            );
+        }
+    }
+}
+
 impl eframe::App for PrecogApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.step(ctx);
@@ -860,7 +1028,7 @@ impl eframe::App for PrecogApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.hud(ui);
-        self.gaze_ring(&ctx);
+        self.gaze_cloud(&ctx);
         self.calibration_windows(&ctx);
         self.popup_window(&ctx);
         self.voice_window(&ctx);

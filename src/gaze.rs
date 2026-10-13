@@ -1,26 +1,47 @@
 //! Gaze regression: eye/head features -> global screen point. Ridge regression with quadratic iris/head terms,
 //! alpha picked by grouped k-fold (held-out calibration dots never seen in training).
+//!
+//! Continuous recalibration: every mouse click is a labelled sample (people look at what they click). Clicks are
+//! added with a recency weight and the model is refitted on each click; on top of that, `ClickCorrector` applies
+//! an instant local correction from the residuals of the last clicks, which absorbs drift (posture, lighting).
 
 use anyhow::{bail, Result};
 use nalgebra::{DMatrix, DVector};
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::path::Path;
 
 pub const NF: usize = 14;
-/// Columns that get squared / crossed: iris x,y of both eyes, pitch, yaw.
+/// Bumped whenever the feature vector changes meaning: older saved models then trigger a recalibration.
+pub const FEATURE_VERSION: u32 = 5;
+/// Columns that get squared / crossed: iris x,y of both eyes, head pitch/yaw.
 const QUAD: [usize; 6] = [0, 1, 3, 4, 6, 7];
 const ALPHAS: [f64; 5] = [0.01, 0.1, 1.0, 10.0, 100.0];
-const MAX_CLICK_SAMPLES: usize = 1500;
+const MAX_CLICK_SAMPLES: usize = 3000;
+/// Click samples fade with age (posture drifts): weight = FLOOR + (1 - FLOOR) * exp(-age / HALF_LIFE).
+const CLICK_RECENCY_S: f64 = 1800.0;
+const CLICK_RECENCY_FLOOR: f64 = 0.25;
 pub const CLICK_GROUP: i64 = 1000;
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct GazeModel {
-    pub f: Vec<[f64; NF]>,
+    #[serde(default)]
+    pub version: u32,
+    /// Feature dimension and the columns that get quadratic terms.
+    pub dim: usize,
+    pub quad: Vec<usize>,
+    pub f: Vec<Vec<f64>>,
     pub y: Vec<[f64; 2]>,
     pub g: Vec<i64>,
     pub w: Vec<f64>,
+    /// Unix time each sample was recorded (for recency weighting of clicks).
+    #[serde(default)]
+    pub ts: Vec<f64>,
+    /// Ridge strength chosen by cross-validation at the last full fit (refits on clicks reuse it).
+    #[serde(default)]
+    pub alpha: f64,
     /// Monitors (left, top, w, h) it was calibrated on.
     pub layout: Vec<(i32, i32, u32, u32)>,
     #[serde(skip)]
@@ -28,13 +49,48 @@ pub struct GazeModel {
 }
 
 struct Fit {
-    mu: [f64; NF],
-    sd: [f64; NF],
+    mu: Vec<f64>,
+    sd: Vec<f64>,
     coef: DMatrix<f64>, // (n_terms, 2)
     cv_error: f64,
+    /// Per-axis (offset, gain) undoing regression shrinkage: with noisy features, ridge predictions are pulled
+    /// towards the middle of the screen (the gaze "can't reach" the edges). Fitted on held-out predictions.
+    stretch: [(f64, f64); 2],
+}
+
+/// Least-squares target = offset + gain * prediction on one axis, gain limited to [1, 1.6]: only ever expands.
+fn stretch_axis(pairs: &[([f64; 2], [f64; 2])], axis: usize) -> (f64, f64) {
+    let n = pairs.len() as f64;
+    if n < 10.0 {
+        return (0.0, 1.0);
+    }
+    let mp = pairs.iter().map(|p| p.0[axis]).sum::<f64>() / n;
+    let mt = pairs.iter().map(|p| p.1[axis]).sum::<f64>() / n;
+    let cov = pairs.iter().map(|p| (p.0[axis] - mp) * (p.1[axis] - mt)).sum::<f64>();
+    let var = pairs.iter().map(|p| (p.0[axis] - mp).powi(2)).sum::<f64>().max(1e-9);
+    let gain = (cov / var).clamp(1.0, 1.6);
+    (mt - gain * mp, gain)
+}
+
+pub fn unix_now() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
 }
 
 impl GazeModel {
+    /// Landmark features (`tracker::features`): fast (30 fps), noisy, head-pose sensitive.
+    pub fn landmarks() -> Self {
+        Self { version: FEATURE_VERSION, dim: NF, quad: QUAD.to_vec(), ..Default::default() }
+    }
+
+    /// UniGaze (pitch, yaw): slower (~10 Hz) but much more accurate and head-robust.
+    pub fn unigaze() -> Self {
+        Self { version: FEATURE_VERSION, dim: 2, quad: vec![0, 1], ..Default::default() }
+    }
+
+    pub fn ready(&self) -> bool {
+        self.fit.is_some()
+    }
+
     pub fn cv_error(&self) -> f64 {
         self.fit.as_ref().map_or(f64::NAN, |f| f.cv_error)
     }
@@ -43,12 +99,14 @@ impl GazeModel {
         self.f.len()
     }
 
-    pub fn add(&mut self, feats: &[[f64; NF]], point: [f64; 2], group: i64, weight: f64) {
+    pub fn add<F: AsRef<[f64]>>(&mut self, feats: &[F], point: [f64; 2], group: i64, weight: f64) {
         for x in feats {
-            self.f.push(*x);
+            debug_assert_eq!(x.as_ref().len(), self.dim);
+            self.f.push(x.as_ref().to_vec());
             self.y.push(point);
             self.g.push(group);
             self.w.push(weight);
+            self.ts.push(unix_now());
         }
         // cap implicit (click) samples, oldest first; calibration samples are kept
         let clicks = self.g.iter().filter(|&&g| g >= CLICK_GROUP).count();
@@ -74,17 +132,19 @@ impl GazeModel {
             self.g.retain(|_| (keep[i], i += 1).0);
             i = 0;
             self.w.retain(|_| (keep[i], i += 1).0);
+            i = 0;
+            self.ts.retain(|_| (keep[i], i += 1).0);
         }
     }
 
-    fn expand(mu: &[f64; NF], sd: &[f64; NF], x: &[f64; NF]) -> Vec<f64> {
-        let z: Vec<f64> = (0..NF).map(|i| (x[i] - mu[i]) / sd[i]).collect();
-        let mut row = Vec::with_capacity(1 + NF + 21);
+    fn expand(quad: &[usize], mu: &[f64], sd: &[f64], x: &[f64]) -> Vec<f64> {
+        let z: Vec<f64> = (0..mu.len()).map(|i| (x[i] - mu[i]) / sd[i]).collect();
+        let mut row = Vec::with_capacity(1 + z.len() + quad.len() * (quad.len() + 1) / 2);
         row.push(1.0);
         row.extend_from_slice(&z);
-        for i in 0..QUAD.len() {
-            for j in i..QUAD.len() {
-                row.push(z[QUAD[i]] * z[QUAD[j]]);
+        for i in 0..quad.len() {
+            for j in i..quad.len() {
+                row.push(z[quad[i]] * z[quad[j]]);
             }
         }
         row
@@ -105,22 +165,61 @@ impl GazeModel {
         xtx.cholesky().map(|c| c.solve(&xty))
     }
 
+    /// Effective sample weights: clicks fade with age, calibration samples keep their weight.
+    fn weights(&self) -> Vec<f64> {
+        let now = unix_now();
+        self.w
+            .iter()
+            .zip(&self.g)
+            .enumerate()
+            .map(|(i, (&w, &g))| {
+                if g >= CLICK_GROUP {
+                    let age = (now - self.ts.get(i).copied().unwrap_or(now)).max(0.0);
+                    w * (CLICK_RECENCY_FLOOR + (1.0 - CLICK_RECENCY_FLOOR) * (-age / CLICK_RECENCY_S).exp())
+                } else {
+                    w
+                }
+            })
+            .collect()
+    }
+
+    /// Full fit: picks the ridge strength by grouped cross-validation. Returns the CV median error (px).
     pub fn fit(&mut self) -> Result<f64> {
+        self.fit_inner(true)
+    }
+
+    /// Quick refit with the current ridge strength (after each click; a few ms).
+    pub fn refit(&mut self) -> Result<()> {
+        self.fit_inner(false).map(|_| ())
+    }
+
+    fn fit_inner(&mut self, cross_validate: bool) -> Result<f64> {
         let n = self.f.len();
         if n < 30 {
             bail!("not enough samples ({n})");
         }
-        let mut mu = [0.0; NF];
-        let mut sd = [0.0; NF];
-        for i in 0..NF {
+        self.ts.resize(n, unix_now());
+        let w = self.weights();
+        let d = self.dim;
+        let mut mu = vec![0.0; d];
+        let mut sd = vec![0.0; d];
+        for i in 0..d {
             mu[i] = self.f.iter().map(|x| x[i]).sum::<f64>() / n as f64;
             sd[i] = (self.f.iter().map(|x| (x[i] - mu[i]).powi(2)).sum::<f64>() / n as f64).sqrt() + 1e-6;
         }
-        let rows: Vec<Vec<f64>> = self.f.iter().map(|x| Self::expand(&mu, &sd, x)).collect();
+        let rows: Vec<Vec<f64>> = self.f.iter().map(|x| Self::expand(&self.quad, &mu, &sd, x)).collect();
         let p = rows[0].len();
         let x = DMatrix::from_fn(n, p, |r, c| rows[r][c]);
         let y = DMatrix::from_fn(n, 2, |r, c| self.y[r][c]);
 
+        let all: Vec<usize> = (0..n).collect();
+        if !cross_validate && self.alpha > 0.0 {
+            let Some(coef) = Self::solve(&x, &y, &w, &all, self.alpha) else { bail!("singular system") };
+            let cv_error = self.cv_error();
+            let stretch = self.fit.as_ref().map_or([(0.0, 1.0); 2], |f| f.stretch);
+            self.fit = Some(Fit { mu, sd, coef, cv_error, stretch });
+            return Ok(cv_error);
+        }
         let mut groups: Vec<i64> = self.g.clone();
         groups.sort_unstable();
         groups.dedup();
@@ -128,15 +227,17 @@ impl GazeModel {
         let k = groups.len().min(5);
         let folds: Vec<Vec<i64>> = (0..k).map(|i| groups.iter().skip(i).step_by(k).copied().collect()).collect();
 
-        let mut best = (f64::INFINITY, 1.0);
+        let mut best = (f64::INFINITY, 1.0, Vec::new());
         for alpha in ALPHAS {
             let mut errs = Vec::with_capacity(n);
+            let mut held_out = Vec::with_capacity(n); // (prediction, target) for rows never seen in training
             for fold in &folds {
                 let (te, tr): (Vec<usize>, Vec<usize>) = (0..n).partition(|&r| fold.contains(&self.g[r]));
-                let Some(c) = Self::solve(&x, &y, &self.w, &tr, alpha) else { continue };
+                let Some(c) = Self::solve(&x, &y, &w, &tr, alpha) else { continue };
                 for r in te {
                     let pred = x.row(r) * &c;
                     errs.push(((pred[0] - y[(r, 0)]).powi(2) + (pred[1] - y[(r, 1)]).powi(2)).sqrt());
+                    held_out.push(([pred[0], pred[1]], [y[(r, 0)], y[(r, 1)]]));
                 }
             }
             if errs.is_empty() {
@@ -145,20 +246,22 @@ impl GazeModel {
             errs.sort_by(f64::total_cmp);
             let med = errs[errs.len() / 2];
             if med < best.0 {
-                best = (med, alpha);
+                best = (med, alpha, held_out);
             }
         }
-        let all: Vec<usize> = (0..n).collect();
-        let Some(coef) = Self::solve(&x, &y, &self.w, &all, best.1) else { bail!("singular system") };
-        self.fit = Some(Fit { mu, sd, coef, cv_error: best.0 });
+        let Some(coef) = Self::solve(&x, &y, &w, &all, best.1) else { bail!("singular system") };
+        self.alpha = best.1;
+        let stretch = [0, 1].map(|a| stretch_axis(&best.2, a));
+        self.fit = Some(Fit { mu, sd, coef, cv_error: best.0, stretch });
         Ok(best.0)
     }
 
-    pub fn predict(&self, x: &[f64; NF]) -> Option<(f64, f64)> {
+    pub fn predict(&self, x: &[f64]) -> Option<(f64, f64)> {
         let f = self.fit.as_ref()?;
-        let row = DVector::from_vec(Self::expand(&f.mu, &f.sd, x));
+        let row = DVector::from_vec(Self::expand(&self.quad, &f.mu, &f.sd, x));
         let p = row.transpose() * &f.coef;
-        Some((p[0], p[1]))
+        let [(ox, gx), (oy, gy)] = f.stretch;
+        Some((ox + gx * p[0], oy + gy * p[1]))
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -170,53 +273,270 @@ impl GazeModel {
     }
 
     pub fn load(path: &Path) -> Result<Self> {
-        let mut m: Self = serde_json::from_slice(&std::fs::read(path)?)?;
+        let bytes = std::fs::read(path)?;
+        // check the feature version first: older files have a different vector length and would not parse
+        let v: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let version = v.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        if version != FEATURE_VERSION {
+            bail!("gaze features changed since that calibration (v{version} -> v{FEATURE_VERSION})");
+        }
+        let mut m: Self = serde_json::from_value(v)?;
         m.fit()?;
         Ok(m)
     }
 }
 
-/// One-euro filter: smooth when still, responsive when moving.
-pub struct OneEuro {
-    min_cutoff: f64,
-    beta: f64,
-    d_cutoff: f64,
-    state: Option<([f64; 2], [f64; 2], f64)>,
+/// Instant local correction from recent clicks: residual = click position - model prediction, blended by
+/// proximity on screen and age. One click right next to the gaze corrects about half of its residual.
+pub struct ClickCorrector<T> {
+    clicks: VecDeque<(f64, [f64; 2], T, [f64; 2])>, // (time, click position, model inputs at the click, residual)
 }
 
-impl OneEuro {
+impl<T> ClickCorrector<T> {
+    const KEEP: usize = 40;
+    const SIGMA: f64 = 350.0; // px: how far a click's correction reaches
+    const TAU: f64 = 900.0; // s: how long it lasts
+    const PRIOR: f64 = 1.0; // shrinkage: weight of "no correction"
+
     pub fn new() -> Self {
-        Self { min_cutoff: 0.6, beta: 0.004, d_cutoff: 1.0, state: None }
+        Self { clicks: VecDeque::new() }
     }
 
-    fn alpha(cutoff: f64, dt: f64) -> f64 {
-        let r = 2.0 * std::f64::consts::PI * cutoff * dt;
-        r / (r + 1.0)
+    pub fn add(&mut self, t: f64, pos: [f64; 2], feats: T) {
+        self.clicks.push_back((t, pos, feats, [0.0; 2]));
+        while self.clicks.len() > Self::KEEP {
+            self.clicks.pop_front();
+        }
     }
 
-    pub fn filter(&mut self, x: [f64; 2], t: f64) -> [f64; 2] {
-        let Some((px, pdx, pt)) = self.state else {
-            self.state = Some((x, [0.0; 2], t));
-            return x;
-        };
-        let dt = (t - pt).max(1e-3);
-        let ad = Self::alpha(self.d_cutoff, dt);
-        let dx = [pdx[0] + ad * ((x[0] - px[0]) / dt - pdx[0]), pdx[1] + ad * ((x[1] - px[1]) / dt - pdx[1])];
-        let cutoff = self.min_cutoff + self.beta * (dx[0].powi(2) + dx[1].powi(2)).sqrt();
-        let a = Self::alpha(cutoff, dt);
-        let nx = [px[0] + a * (x[0] - px[0]), px[1] + a * (x[1] - px[1])];
-        self.state = Some((nx, dx, t));
-        nx
+    /// Recompute residuals against the current predictor (call after every refit).
+    pub fn update_residuals(&mut self, predict: impl Fn(&T) -> Option<(f64, f64)>) {
+        for c in self.clicks.iter_mut() {
+            if let Some((px, py)) = predict(&c.2) {
+                c.3 = [c.1[0] - px, c.1[1] - py];
+            }
+        }
     }
+
+    pub fn correction(&self, p: [f64; 2], t: f64) -> [f64; 2] {
+        let (mut sum, mut wsum) = ([0.0; 2], Self::PRIOR);
+        for (ct, pos, _, r) in &self.clicks {
+            let d2 = (p[0] - pos[0]).powi(2) + (p[1] - pos[1]).powi(2);
+            let k = (-d2 / (2.0 * Self::SIGMA * Self::SIGMA)).exp() * (-(t - ct).max(0.0) / Self::TAU).exp();
+            sum[0] += k * r[0];
+            sum[1] += k * r[1];
+            wsum += k;
+        }
+        [sum[0] / wsum, sum[1] / wsum]
+    }
+}
+
+/// Adaptive Kalman filter for gaze. Eyes alternate between fixations (still: average the noise away) and
+/// saccades (fast jumps: follow at once). A plain Kalman filter would lag on saccades or be noisy on fixations, so:
+/// - fixation: random-walk Kalman (2D, isotropic); the measurement noise is estimated online from the innovations;
+/// - saccade: when 2 consecutive measurements fall far outside the predicted distribution (> 4 sigma) and agree
+///   with each other, the state is reset onto them (~2 frames of latency);
+/// - a single outlier frame (blink, bad landmark, head jolt) is ignored.
+pub struct GazeKalman {
+    x: Option<[f64; 2]>,
+    p: f64,         // state variance (px^2, per axis)
+    r: f64,         // measurement variance (px^2, per axis), learned
+    pending: Vec<[f64; 2]>,
+    outliers: u32,
+    shown: Option<[f64; 2]>,
+    last_t: f64,
+}
+
+impl GazeKalman {
+    const Q: f64 = 40.0 * 40.0; // px^2/s: how fast the fixation point may drift
+    const GATE: f64 = 16.0; // squared Mahalanobis distance (2D) beyond which a sample is an outlier
+    const EASE: f64 = 0.035; // s: display easing, just enough to avoid a teleport flicker
+
+    pub fn new(initial_noise: f64) -> Self {
+        let s = initial_noise.clamp(20.0, 250.0);
+        Self { x: None, p: s * s, r: s * s, pending: Vec::new(), outliers: 0, shown: None, last_t: 0.0 }
+    }
+
+    /// Estimated per-sample noise in px (one axis).
+    pub fn jitter(&self) -> f64 {
+        self.r.sqrt()
+    }
+
+    pub fn reset(&mut self) {
+        self.x = None;
+        self.shown = None;
+        self.pending.clear();
+        self.outliers = 0;
+    }
+
+    fn jump(&mut self, to: [f64; 2]) {
+        self.x = Some(to);
+        self.p = self.r / 2.0;
+        self.pending.clear();
+        self.outliers = 0;
+    }
+
+    pub fn update(&mut self, z: [f64; 2], t: f64) -> [f64; 2] {
+        let dt = (t - self.last_t).clamp(0.0, 0.5);
+        match self.x {
+            None => self.jump(z),
+            Some(x) => {
+                self.p += Self::Q * dt; // predict (random walk)
+                let s = self.p + self.r;
+                let nu = [z[0] - x[0], z[1] - x[1]];
+                let d2 = (nu[0] * nu[0] + nu[1] * nu[1]) / s;
+                if d2 <= Self::GATE {
+                    let k = self.p / s;
+                    self.x = Some([x[0] + k * nu[0], x[1] + k * nu[1]]);
+                    self.p *= 1.0 - k;
+                    // learn the measurement noise from fixation innovations (E[nu^2] per axis = S)
+                    let r_obs = (nu[0] * nu[0] + nu[1] * nu[1]) / 2.0 - self.p;
+                    self.r = (0.98 * self.r + 0.02 * r_obs.max(0.0)).clamp(15.0 * 15.0, 250.0 * 250.0);
+                    self.pending.clear();
+                    self.outliers = 0;
+                } else {
+                    self.pending.push(z);
+                    self.outliers += 1;
+                    let m = mean(self.pending.iter().copied());
+                    let sigma = self.r.sqrt();
+                    let agree = self.pending.iter().all(|&q| dist(q, m) <= 3.0 * sigma);
+                    if agree && self.pending.len() >= 2 {
+                        self.jump(m); // saccade
+                    } else if !agree && self.pending.len() >= 2 {
+                        self.pending.remove(0);
+                    }
+                    if self.outliers >= 6 {
+                        // much noisier than estimated: widen and re-anchor
+                        self.r = (self.r * 2.0).min(250.0 * 250.0);
+                        let pts: Vec<_> = self.pending.iter().rev().take(3).copied().collect();
+                        self.jump(mean(pts));
+                    }
+                }
+            }
+        }
+        let c = self.x.unwrap();
+        let shown = self.shown.get_or_insert(c);
+        let a = 1.0 - (-(t - self.last_t).max(0.0) / Self::EASE).exp();
+        shown[0] += a * (c[0] - shown[0]);
+        shown[1] += a * (c[1] - shown[1]);
+        self.last_t = t;
+        *shown
+    }
+}
+
+fn dist(a: [f64; 2], b: [f64; 2]) -> f64 {
+    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
+}
+
+fn mean(pts: impl IntoIterator<Item = [f64; 2]>) -> [f64; 2] {
+    let (mut s, mut n) = ([0.0f64; 2], 0.0f64);
+    for p in pts {
+        s[0] += p[0];
+        s[1] += p[1];
+        n += 1.0;
+    }
+    [s[0] / n.max(1.0), s[1] / n.max(1.0)]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Noisy fixations, a single-frame spike, and a saccade: steady during fixations, ignores the spike,
+    /// follows the saccade within ~2-3 frames.
+    #[test]
+    fn kalman_filter() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        use rand::Rng;
+        let mut f = GazeKalman::new(100.0);
+        let dt = 1.0 / 30.0;
+        let (mut moves, mut last, mut spike_shift) = (Vec::new(), None::<[f64; 2]>, 0.0);
+        let mut lag = None;
+        for i in 0..240 {
+            let t = i as f64 * dt;
+            let target = if i < 120 { [400.0, 300.0] } else { [1200.0, 700.0] };
+            let mut p = [target[0] + rng.random_range(-110.0..110.0), target[1] + rng.random_range(-110.0..110.0)];
+            if i == 80 {
+                p = [1500.0, 100.0]; // one bad frame
+            }
+            let o = f.update(p, t);
+            if i == 81 {
+                spike_shift = dist(o, last.unwrap());
+            }
+            if (30..120).contains(&i) && i != 81 {
+                if let Some(l) = last {
+                    moves.push(dist(o, l));
+                }
+            }
+            if i >= 120 && lag.is_none() && dist(o, target) < 100.0 {
+                lag = Some((i - 120) as f64 * dt);
+            }
+            last = Some(o);
+        }
+        let m = moves.iter().sum::<f64>() / moves.len() as f64;
+        println!("kalman: fixation motion {m:.1} px/frame, spike moved it {spike_shift:.0} px, saccade lag {lag:?} s");
+        assert!(m < 10.0, "too jumpy during fixation: {m}");
+        assert!(spike_shift < 30.0, "spike not rejected: {spike_shift}");
+        assert!(lag.is_some_and(|l| l <= 0.15), "saccade lag {lag:?}");
+    }
+
+    /// Calibrate on a synthetic eye->screen mapping, then the user's posture drifts (feature offset):
+    /// clicks must bring the error back down quickly.
+    #[test]
+    fn clicks_fix_drift() {
+        use rand::Rng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(5);
+        let feat = |p: [f64; 2], drift: f64, rng: &mut rand::rngs::StdRng| {
+            let mut f = [0.0; NF];
+            for v in f.iter_mut() {
+                *v = rng.random_range(-0.05..0.05);
+            }
+            f[0] = p[0] / 1000.0 + drift + rng.random_range(-0.02..0.02);
+            f[1] = p[1] / 1000.0 + rng.random_range(-0.02..0.02);
+            f
+        };
+        let mut m = GazeModel::landmarks();
+        for g in 0..9 {
+            let p = [200.0 + 500.0 * (g % 3) as f64, 150.0 + 300.0 * (g / 3) as f64];
+            let fs: Vec<_> = (0..20).map(|_| feat(p, 0.0, &mut rng)).collect();
+            m.add(&fs, p, g, 1.0);
+        }
+        m.fit().unwrap();
+        let mut corr = ClickCorrector::new();
+        let drift = 0.15; // = 150 px shift
+        let err = |m: &GazeModel, corr: &ClickCorrector<[f64; NF]>, rng: &mut rand::rngs::StdRng| {
+            let mut e = 0.0;
+            for _ in 0..50 {
+                let p = [rng.random_range(200.0..1200.0), rng.random_range(150.0..750.0)];
+                let (x, y) = m.predict(&feat(p, drift, rng)).unwrap();
+                let c = corr.correction([x, y], 0.0);
+                e += ((x + c[0] - p[0]).powi(2) + (y + c[1] - p[1]).powi(2)).sqrt() / 50.0;
+            }
+            e
+        };
+        let before = err(&m, &corr, &mut rng);
+        for k in 0..15 {
+            let p = [rng.random_range(200.0..1200.0), rng.random_range(150.0..750.0)];
+            let fs: Vec<_> = (0..8).map(|_| feat(p, drift, &mut rng)).collect();
+            let mut mean = [0.0; NF];
+            for f in &fs {
+                for i in 0..NF {
+                    mean[i] += f[i] / fs.len() as f64;
+                }
+            }
+            m.add(&fs, p, CLICK_GROUP + k, 1.0);
+            corr.add(0.0, p, mean);
+            m.refit().unwrap();
+            corr.update_residuals(|f: &[f64; NF]| m.predict(f));
+        }
+        let after = err(&m, &corr, &mut rng);
+        println!("mean error after drift: {before:.0}px -> after 15 clicks: {after:.0}px");
+        assert!(after < before * 0.5, "{before} -> {after}");
+    }
+
     #[test]
     fn fits_synthetic() {
-        let mut m = GazeModel::default();
+        let mut m = GazeModel::landmarks();
         let mut rng = rand::rngs::StdRng::seed_from_u64(1);
         use rand::Rng;
         for g in 0..16 {
