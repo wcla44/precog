@@ -5,7 +5,7 @@ use crate::actions::{self, Action};
 use crate::agent::Agent;
 use crate::cloud::{self, Smudge};
 use crate::dictation::{self, Dictation};
-use crate::gaze::{ClickCorrector, FixationFilter, GazeModel, CLICK_GROUP, FEATURE_VERSION, NF};
+use crate::gaze::{ClickCorrector, GazeKalman, GazeModel, CLICK_GROUP, FEATURE_VERSION, NF};
 use crate::gestures::{Debounce, Pose, Swipe};
 use crate::monitors::{self, Monitor};
 use crate::settings::Settings;
@@ -232,7 +232,7 @@ pub struct PrecogApp {
     model: Option<GazeModel>,
     /// UniGaze angles -> screen; fused with the landmark model (see `fused`).
     umodel: Option<GazeModel>,
-    filter: FixationFilter,
+    filter: GazeKalman,
     gaze: Option<(f64, f64)>,
     face: bool,
     agent: Agent,
@@ -301,7 +301,7 @@ impl PrecogApp {
             monitors,
             tracker,
             model,
-            filter: FixationFilter::new(100.0),
+            filter: GazeKalman::new(100.0),
             gaze: None,
             face: false,
             popup: None,
@@ -325,7 +325,7 @@ impl PrecogApp {
         };
         app.apply();
         if let Some(m) = &app.model {
-            app.filter = FixationFilter::new(m.cv_error() * 0.5);
+            app.filter = GazeKalman::new(m.cv_error() * 0.5);
         }
         if app.cfg.gesture && app.cfg.voice {
             app.dictation.preload();
@@ -497,7 +497,7 @@ impl PrecogApp {
         match c.model.fit() {
             Ok(err) => {
                 let _ = c.model.save(&paths::gaze_model());
-                self.filter = FixationFilter::new(err * 0.5);
+                self.filter = GazeKalman::new(err * 0.5);
                 println!(
                     "calibrated on {} screen(s): {} samples, cross-validated median error {err:.0}px",
                     self.monitors.len(),
@@ -874,10 +874,22 @@ fn fused(land: &GazeModel, uni: Option<&GazeModel>, inp: &GazeInput) -> Option<(
     let (lx, ly) = land.predict(&inp.land)?;
     if let (Some(um), Some((angles, land_then))) = (uni.filter(|u| u.ready()), &inp.ug) {
         if let (Some((ux, uy)), Some((tx, ty))) = (um.predict(angles), land.predict(land_then)) {
-            return Some((ux + lx - tx, uy + ly - ty));
+            // The landmark model is unreliable while the head moves (the eyes counter-rotate to keep the gaze
+            // fixed, which it reads as gaze motion). Use its motion only while the head is still; otherwise trust
+            // UniGaze alone, which models head pose.
+            let w = head_still(&inp.land, land_then);
+            return Some((ux + w * (lx - tx), uy + w * (ly - ty)));
         }
     }
     Some((lx, ly))
+}
+
+/// 1 when the head pose is the same in both frames, falling to 0 as it rotates (~2 deg) or moves (~1.5% of the
+/// image). Feature layout: see `tracker::features` (6 pitch, 7 yaw, 8 roll, 9-10 face centre, 11 face scale).
+fn head_still(a: &[f64; NF], b: &[f64; NF]) -> f64 {
+    let rot = ((a[6] - b[6]).powi(2) + (a[7] - b[7]).powi(2) + (a[8] - b[8]).powi(2)).sqrt() / 0.035;
+    let pos = ((a[9] - b[9]).powi(2) + (a[10] - b[10]).powi(2)).sqrt() / 0.015 + (a[11] - b[11]).abs() / 0.01;
+    (-(rot * rot + pos * pos)).exp()
 }
 
 fn median(v: &std::collections::VecDeque<f64>) -> f64 {
