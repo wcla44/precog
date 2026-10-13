@@ -53,5 +53,5 @@ cargo test
 
 - Coordinates are global logical screen coordinates (points on macOS, pixels on X11), with the origin at the top-left. This is the space used by window positions, mouse coordinates and Quartz window bounds.
 - Any change to pre- or post-processing in `src/vision.rs` must be validated against MediaPipe on real images (`--dump-landmarks`). Face landmarks currently match within about 1px.
-- Settings are stored at `~/.config/precog/config.json` with mode 600, because the file may contain an API key. Never log or commit secrets.
+- Settings are stored at `~/.config/precog/config.json` with mode 600, because the file may contain an API key. Never log or commit secrets, model weights, or calibration recordings (`models/` is gitignored; recordings live in `~/.local/share/precog/`).
 - Actions are always confirmed by the user (gaze plus gesture, or a click). Never add a code path that runs an LLM-suggested action without confirmation.

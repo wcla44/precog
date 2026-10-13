@@ -500,7 +500,7 @@ mod tests {
         m.fit().unwrap();
         let mut corr = ClickCorrector::new();
         let drift = 0.15; // = 150 px shift
-        let err = |m: &GazeModel, corr: &ClickCorrector, rng: &mut rand::rngs::StdRng| {
+        let err = |m: &GazeModel, corr: &ClickCorrector<[f64; NF]>, rng: &mut rand::rngs::StdRng| {
             let mut e = 0.0;
             for _ in 0..50 {
                 let p = [rng.random_range(200.0..1200.0), rng.random_range(150.0..750.0)];
