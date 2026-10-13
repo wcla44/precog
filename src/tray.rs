@@ -66,7 +66,7 @@ fn build(cfg: &Settings) -> anyhow::Result<(Items, Ids)> {
     let check = |label: &str, on: bool| CheckMenuItem::new(label, true, on, None);
     let checks: Vec<(&'static str, CheckMenuItem)> = vec![
         ("agent", check("Suggestions on", cfg.agent)),
-        ("dot", check("Show gaze ring", cfg.dot)),
+        ("dot", check("Show gaze cloud", cfg.dot)),
         ("gesture", check("Hand gestures", cfg.gesture)),
         ("voice", check("✋ Open hand → voice typing", cfg.voice)),
         ("learn", check("Learn from my clicks", cfg.learn)),

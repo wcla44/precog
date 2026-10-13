@@ -3,6 +3,7 @@
 
 use crate::actions::{self, Action};
 use crate::agent::Agent;
+use crate::cloud::{self, GazeCloud};
 use crate::dictation::{self, Dictation};
 use crate::gaze::{GazeModel, OneEuro, CLICK_GROUP, NF};
 use crate::gestures::{Debounce, Pose, Swipe};
@@ -11,7 +12,7 @@ use crate::settings::Settings;
 use crate::tracker::Tracker;
 use crate::tray::{self, Tray};
 use crate::{llm, now, paths};
-use egui::{Align2, Color32, CornerRadius, FontId, Frame, Margin, Pos2, Stroke, ViewportBuilder, ViewportCommand, ViewportId};
+use egui::{Align2, Color32, CornerRadius, FontId, Frame, Margin, Pos2, ViewportBuilder, ViewportCommand, ViewportId};
 use parking_lot::Mutex;
 use rand::seq::SliceRandom;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -232,7 +233,8 @@ pub struct PrecogApp {
     tray: Option<Tray>,
     tray_status: String,
     show_settings: bool,
-    mouse: Option<enigo::Enigo>,
+    cloud: GazeCloud,
+    cloud_pos: Option<[f64; 2]>,
     last: f64,
     custom_model: String,
 }
@@ -267,7 +269,6 @@ impl PrecogApp {
         } else {
             Tray::new(&cfg).map_err(|e| println!("tray icon unavailable: {e:#}")).ok()
         };
-        let mouse = actions::enigo().ok();
         let want_calibration = model.is_none();
         let mut app = Self {
             agent: Agent::new(monitors.clone()),
@@ -294,7 +295,8 @@ impl PrecogApp {
             tray,
             tray_status: String::new(),
             show_settings: false,
-            mouse,
+            cloud: GazeCloud::new(),
+            cloud_pos: None,
             last: now(),
         };
         app.apply();
@@ -360,6 +362,7 @@ impl PrecogApp {
             _ => {}
         }
 
+        self.cloud_pos = self.cloud.update(t, dt, if self.calib.is_none() { self.gaze } else { None });
         self.learn_from_clicks();
         self.handle_tray(ctx);
 
@@ -584,25 +587,19 @@ impl PrecogApp {
         }
     }
 
-    fn gaze_ring(&mut self, ctx: &egui::Context) {
-        let Some((x, y)) = self.gaze else { return };
+    fn gaze_cloud(&mut self, ctx: &egui::Context) {
+        let Some([x, y]) = self.cloud_pos else { return };
         if !self.cfg.dot || self.calib.is_some() {
             return;
         }
-        // never sit under the cursor (would eat clicks)
-        let near = self
-            .mouse
-            .as_ref()
-            .and_then(|m| enigo::Mouse::location(m).ok())
-            .is_some_and(|(mx, my)| (x - mx as f64).powi(2) + (y - my as f64).powi(2) < 80.0f64.powi(2));
-        let s = 44.0;
+        let s = cloud::SIZE;
+        let cloud = &self.cloud;
+        // click-through, so it never needs to dodge the cursor
         ctx.show_viewport_immediate(
             ViewportId::from_hash_of("gaze"),
-            overlay("precog gaze", [s, s], [x as f32 - s / 2.0, y as f32 - s / 2.0]).with_mouse_passthrough(true).with_visible(!near),
+            overlay("precog gaze", [s, s], [x as f32 - s / 2.0, y as f32 - s / 2.0]).with_mouse_passthrough(true),
             |ui, _| {
-                egui::CentralPanel::no_frame().show(ui, |ui| {
-                    ui.painter().circle_stroke(Pos2::new(s / 2.0, s / 2.0), s / 2.0 - 4.0, Stroke::new(4.0, RED));
-                });
+                egui::CentralPanel::no_frame().show(ui, |ui| cloud.paint(ui.painter(), Pos2::new(s / 2.0, s / 2.0), now()));
             },
         );
     }
@@ -769,7 +766,7 @@ fn overlay(title: &str, size: [f32; 2], pos: [f32; 2]) -> ViewportBuilder {
 fn settings_form(ui: &mut egui::Ui, c: &mut Settings, custom_model: &mut String, recalibrate: &mut bool) {
     ui.heading("General");
     ui.checkbox(&mut c.agent, "Suggestions (LLM looks at the screen when your gaze settles)");
-    ui.checkbox(&mut c.dot, "Show gaze ring");
+    ui.checkbox(&mut c.dot, "Show gaze cloud");
     ui.checkbox(&mut c.learn, "Learn from my clicks (improves gaze accuracy over time)");
     ui.add(egui::Slider::new(&mut c.dwell, 1.0..=4.0).text("fixation before asking (s)"));
     ui.add(egui::Slider::new(&mut c.interval, 5.0..=120.0).logarithmic(true).text("min time between asks (s)"));
@@ -860,7 +857,7 @@ impl eframe::App for PrecogApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.hud(ui);
-        self.gaze_ring(&ctx);
+        self.gaze_cloud(&ctx);
         self.calibration_windows(&ctx);
         self.popup_window(&ctx);
         self.voice_window(&ctx);

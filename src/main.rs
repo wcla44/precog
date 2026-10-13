@@ -2,6 +2,7 @@
 
 mod actions;
 mod agent;
+mod cloud;
 #[cfg(target_os = "macos")]
 mod camera_mac;
 mod dictation;
